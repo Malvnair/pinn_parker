@@ -1,0 +1,154 @@
+# Configuration for Parker Instability PINN
+# Physics parameters matching Basu et al. (1997) / Athena++ setup
+
+# Physical parameters (dimensional)
+physics:
+  alpha: 1.0                    # Ratio of magnetic to thermal pressure B^2/(8*pi*P)
+  cs: 1.0                       # Isothermal sound speed (nondimensional = 1)
+  g0: 1.0                       # Gravitational acceleration (nondimensional = 1)
+  rho0: 1.0                     # Reference density at z=0 (nondimensional = 1)
+  epsilon: 0.1                  # Perturbation amplitude (kinetic energy < 1% of other energies)
+
+# Derived scale height: H = (1 + alpha) * cs^2 / g0
+# With alpha=1, cs=1, g0=1: H = 2.0
+
+# Domain (nondimensionalized by H, matching Basu's setup)
+domain:
+  y_min: 0.0
+  y_max: 12.0                   # Y_half = 12, so lambda_y = 24 ~ lambda_y,max
+  z_min: 0.0                    # Using upper half with midplane symmetry
+  z_max: 25.0                   # Z_top = 25 (so lambda_z/2 = 50)
+  t_min: 0.0
+  t_max: 30.0                   # Run to t=30 in nondimensional units
+
+# Network architecture
+network:
+  hidden_layers: 8              # Number of hidden layers
+  hidden_units: 128             # Units per layer
+  activation: 'siren'           
+  siren_omega_0: 30.0           
+  siren_omega: 1.0              
+  use_fourier_features: false   
+  fourier_scale: 1.0
+  output_transform: true        # Apply physics-informed output transform
+  use_Ax_potential: true        # Use magnetic potential for div-B free constraint
+
+# Training configuration
+training:
+  # Stage 1: IC-only fit
+  ic_fit:
+    enabled: true
+    epochs: 500
+    lr: 0.001
+    tolerance: 0.0001             # Relative L2 error threshold
+
+  # Stage 2: Overfit test
+  overfit_test:
+    enabled: true
+    n_points: 256
+    epochs: 200
+    loss_threshold: 0.001
+
+  # Stage 3: Full training
+  full:
+    epochs: 20000
+    batch_size_collocation: 1024
+    batch_size_ic: 2048
+    batch_size_bc: 2048
+    
+    # Optimizer
+    optimizer: 'adam'          
+    lr_initial: 0.001
+    lr_min: 0.000001
+    lr_schedule: 'cosine'       
+    weight_decay: 0.0
+    
+    # L-BFGS polish
+    lbfgs_polish:
+      enabled: true
+      start_epoch: 40000
+      max_iter: 50
+      lr: 0.5
+    
+    # Gradient clipping
+    grad_clip: 1.0
+    
+    # Time curriculum
+    curriculum:
+      enabled: true
+      t_warm: 5.0               
+      t_grow_epochs: 50000      
+    
+    # Adaptive sampling
+    adaptive_sampling:
+      enabled: true
+      start_epoch: 1000
+      interval: 500            # Resample every N epochs
+      residual_fraction: 0.5    # Fraction of points from high-residual regions
+
+# Loss weights
+loss_weights:
+  pde:
+    continuity: 10.0
+    momentum_y: 10.0
+    momentum_z: 10.0
+    induction: 10.0
+  ic: 10.0                     # Strong IC weight initially
+  bc:
+    y_periodic: 1.0
+    z_bottom: 1.0
+    z_top: 1.0
+  divB: 10.0                    # If not using Ax potential
+  vreg: 0.001
+
+  # Adaptive weighting
+  adaptive:
+    enabled: true
+    method: 'softadapt'         
+    softadapt_beta: 0.9         
+
+# Collocation sampling
+sampling:
+  method: 'latin_hypercube'     
+  n_collocation: 32768
+  n_ic: 4096
+  n_bc: 2048
+
+# Checkpointing
+checkpoint:
+  interval: 500                 # Save every N epochs
+  keep_last: 5                  # Keep last N checkpoints
+  atomic_save: true
+
+# Logging
+logging:
+  interval: 100                 # Log every N epochs
+  tensorboard: false
+
+# Sanity checks
+sanity:
+  interval: 1000                # Check every N epochs
+  nan_recovery:
+    enabled: true
+    lr_factor: 0.5              # Reduce LR on NaN
+    max_retries: 3
+  ic_drift_threshold: 0.1       # Boost IC weight if error exceeds this
+
+# Evaluation grid for snapshots
+eval_grid:
+  ny: 128
+  nz: 128
+  times: [0, 10, 20, 30]
+
+# Precision
+precision: 'float64'            
+
+# Random seed
+seed: 42
+
+# Device
+device: 'cpu'                   
+
+# Resume
+resume: true                    # Auto-resume if checkpoint exists
+fresh: false                    # Force fresh start (override resume)
