@@ -287,24 +287,32 @@ class Evaluator:
             'rho_min': float(data['rho'].min()),
             'rho_mean': float(data['rho'].mean()),
             'v_max': float(data['v_mag'].max()),
+            'KE': float(0.5 * np.mean(data['rho'] * data['v_mag']**2)),
             'By_max': float(np.abs(data['By']).max()),
             'Bz_max': float(np.abs(data['Bz']).max()),
             'divB_max': float(np.abs(data['divB']).max()),
             'divB_rms': float(np.sqrt(np.mean(data['divB']**2))),
         }
         
-        # Density enhancement at valley (y=0, z=0)
-        iy_valley = 0
-        iz_midplane = 0
+        # Index nearest midplane and valley location
+        iy_valley = int(np.argmin(np.abs(data['y'] - 0.0)))   # y=0 valley
+        iz_midplane = int(np.argmin(np.abs(data['z'] - 0.0))) # z=0 midplane
+
         diagnostics['rho_valley'] = float(data['rho'][iy_valley, iz_midplane])
-        
-        # Density at arch (y=Y_half, z=0)
-        iy_arch = self.ny - 1
+
+        # Arch at y = +Y_half (right boundary in your symmetric domain)
+        iy_arch = int(np.argmin(np.abs(data['y'] - self.y_max)))
         diagnostics['rho_arch'] = float(data['rho'][iy_arch, iz_midplane])
-        
-        # Ratio (as in Basu Fig 3)
+
         diagnostics['rho_enhancement'] = diagnostics['rho_valley'] / self.physics.rho0_nd
-        
+
+        # Mode amplitude projection onto sin(pi y/Y_half) * cos(pi z/2Z)
+        Y_grid, Z_grid = np.meshgrid(data['y'], data['z'], indexing='ij')
+        phi = np.sin(np.pi * Y_grid / self.physics.Y_half) * \
+              np.cos(np.pi * Z_grid / (2.0 * self.physics.Z_top))
+        denom = np.mean(phi**2) + 1e-12
+        diagnostics['mode_amp'] = float(-np.mean(data['vz'] * phi) / denom)
+
         return diagnostics
 
 

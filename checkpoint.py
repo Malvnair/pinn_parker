@@ -183,7 +183,9 @@ class CheckpointManager:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         
-        checkpoint = torch.load(path, map_location=device)
+        # PyTorch 2.6+ defaults to weights_only=True, which breaks loading
+        # full training checkpoints containing optimizer/scheduler/RNG states.
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
         
         # Restore model
         model.load_state_dict(checkpoint['model_state_dict'])

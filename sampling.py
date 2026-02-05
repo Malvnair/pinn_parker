@@ -12,7 +12,6 @@ import torch
 import numpy as np
 from typing import Tuple, Dict, Optional, List
 from scipy.stats import qmc
-from scipy import stats
 
 
 
@@ -32,6 +31,8 @@ class CollocationSampler:
         self.n_collocation = config['sampling']['n_collocation']
         self.n_ic = config['sampling']['n_ic']
         self.n_bc = config['sampling']['n_bc']
+
+        self.time_stratified = config.get('training', {}).get('full', {}).get('time_stratified', {})
         
         # Current time horizon for curriculum learning
         self.current_t_max = self.t_max
@@ -52,55 +53,107 @@ class CollocationSampler:
         Returns:
             t, y, z tensors of shape (n_points,)
         """
-        if self.method == 'uniform':
-            t, y, z = self._sample_uniform(n_points)
-        elif self.method == 'latin_hypercube':
-            t, y, z = self._sample_lhs(n_points)
-        elif self.method == 'sobol':
-            t, y, z = self._sample_sobol(n_points)
-        else:
-            raise ValueError(f"Unknown sampling method: {self.method}")
+        t, y, z = self._sample_interior_np(n_points, self.t_min, self.current_t_max)
         
         return (
             torch.tensor(t, device=device, dtype=dtype),
             torch.tensor(y, device=device, dtype=dtype),
             torch.tensor(z, device=device, dtype=dtype),
         )
+
+    def sample_interior_stratified(
+        self,
+        n_points: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample interior points with time-stratified windows to improve temporal propagation.
+        """
+        if not self.time_stratified.get('enabled', False):
+            return self.sample_interior(n_points, device, dtype)
+
+        fractions = self.time_stratified.get('fractions', [0.5, 0.3, 0.2])
+        time_fracs = self.time_stratified.get('time_fractions', [0.2, 0.6, 1.0])
+        if len(fractions) != len(time_fracs):
+            raise ValueError("time_stratified.fractions and time_stratified.time_fractions must have same length")
+
+        fractions = np.array(fractions, dtype=np.float64)
+        fractions = fractions / fractions.sum()
+
+        counts = np.floor(fractions * n_points).astype(int)
+        remainder = n_points - counts.sum()
+        counts[:remainder] += 1
+
+        t_all = []
+        y_all = []
+        z_all = []
+        t_lo = self.t_min
+        for count, tf in zip(counts, time_fracs):
+            if count <= 0:
+                t_lo = self.t_min + float(tf) * (self.current_t_max - self.t_min)
+                continue
+
+            t_hi = self.t_min + float(tf) * (self.current_t_max - self.t_min)
+            t_hi = max(t_hi, t_lo + 1e-8)
+            t_np, y_np, z_np = self._sample_interior_np(count, t_lo, t_hi)
+            t_all.append(t_np)
+            y_all.append(y_np)
+            z_all.append(z_np)
+            t_lo = t_hi
+
+        t = np.concatenate(t_all, axis=0)
+        y = np.concatenate(y_all, axis=0)
+        z = np.concatenate(z_all, axis=0)
+
+        return (
+            torch.tensor(t, device=device, dtype=dtype),
+            torch.tensor(y, device=device, dtype=dtype),
+            torch.tensor(z, device=device, dtype=dtype),
+        )
+
+    def _sample_interior_np(
+        self,
+        n_points: int,
+        t_start: float,
+        t_end: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.method == 'uniform':
+            return self._sample_uniform(n_points, t_start, t_end)
+        if self.method == 'latin_hypercube':
+            return self._sample_lhs(n_points, t_start, t_end)
+        if self.method == 'sobol':
+            return self._sample_sobol(n_points, t_start, t_end)
+        raise ValueError(f"Unknown sampling method: {self.method}")
     
-    def _sample_uniform(self, n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Uniform random sampling with z biased toward midplane."""
-        t = np.random.uniform(self.t_min, self.current_t_max, n)
+    def _sample_uniform(self, n: int, t_start: float, t_end: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Uniform random sampling across the full domain."""
+        t = np.random.uniform(t_start, t_end, n)
         y = np.random.uniform(self.y_min, self.y_max, n)
-        # Beta distribution biases sampling toward lower z where instability develops
-        z_normalized = np.random.beta(1.5, 3.0, n)  # Peaks around z/z_max ~ 0.3
-        z = self.z_min + (self.z_max - self.z_min) * z_normalized
+        z = np.random.uniform(self.z_min, self.z_max, n)
         return t, y, z
     
-    def _sample_lhs(self, n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _sample_lhs(self, n: int, t_start: float, t_end: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Latin Hypercube Sampling."""
         sampler = qmc.LatinHypercube(d=3)
         sample = sampler.random(n=n)
         
         # Scale to domain
-        t = sample[:, 0] * (self.current_t_max - self.t_min) + self.t_min
+        t = sample[:, 0] * (t_end - t_start) + t_start
         y = sample[:, 1] * (self.y_max - self.y_min) + self.y_min
-        z_uniform = sample[:, 2]
-        z_normalized = stats.beta.ppf(z_uniform, 1.5, 3.0)
-        z = self.z_min + (self.z_max - self.z_min) * z_normalized
+        z = sample[:, 2] * (self.z_max - self.z_min) + self.z_min
         
         return t, y, z
     
-    def _sample_sobol(self, n: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _sample_sobol(self, n: int, t_start: float, t_end: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sobol sequence sampling."""
         sampler = qmc.Sobol(d=3, scramble=True)
         sample = sampler.random(n=n)
         
         # Scale to domain
-        t = sample[:, 0] * (self.current_t_max - self.t_min) + self.t_min
+        t = sample[:, 0] * (t_end - t_start) + t_start
         y = sample[:, 1] * (self.y_max - self.y_min) + self.y_min
-        z_uniform = sample[:, 2]
-        z_normalized = stats.beta.ppf(z_uniform, 1.5, 3.0)
-        z = self.z_min + (self.z_max - self.z_min) * z_normalized
+        z = sample[:, 2] * (self.z_max - self.z_min) + self.z_min
         
         return t, y, z
     
@@ -173,7 +226,7 @@ class CollocationSampler:
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample points on z = z_min (midplane symmetry).
+        Sample points on z = 0 (midplane symmetry constraints).
         
         Returns:
             t, y, z tensors of shape (n_points,)
@@ -187,8 +240,37 @@ class CollocationSampler:
             t = np.random.uniform(self.t_min, self.current_t_max, n_points)
             y = np.random.uniform(self.y_min, self.y_max, n_points)
         
-        z = np.full(n_points, self.z_min)
+        z = np.zeros(n_points)
         
+        return (
+            torch.tensor(t, device=device, dtype=dtype),
+            torch.tensor(y, device=device, dtype=dtype),
+            torch.tensor(z, device=device, dtype=dtype),
+        )
+
+    def sample_bc_z_lower(
+        self,
+        n_points: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample points on lower rigid lid z = z_min.
+
+        Returns:
+            t, y, z tensors of shape (n_points,)
+        """
+        if self.method == 'latin_hypercube':
+            sampler = qmc.LatinHypercube(d=2)
+            sample = sampler.random(n=n_points)
+            t = sample[:, 0] * (self.current_t_max - self.t_min) + self.t_min
+            y = sample[:, 1] * (self.y_max - self.y_min) + self.y_min
+        else:
+            t = np.random.uniform(self.t_min, self.current_t_max, n_points)
+            y = np.random.uniform(self.y_min, self.y_max, n_points)
+
+        z = np.full(n_points, self.z_min)
+
         return (
             torch.tensor(t, device=device, dtype=dtype),
             torch.tensor(y, device=device, dtype=dtype),
@@ -283,6 +365,8 @@ class AdaptiveSampler:
         Returns combined uniform + adaptive samples.
         """
         if not self.enabled or epoch < self.start_epoch or self.adaptive_points is None:
+            if self.base_sampler.time_stratified.get('enabled', False):
+                return self.base_sampler.sample_interior_stratified(n_total, device, dtype)
             return self.base_sampler.sample_interior(n_total, device, dtype)
         
         # Number of adaptive points to include
@@ -290,9 +374,14 @@ class AdaptiveSampler:
         n_uniform = n_total - n_adaptive
         
         # Sample uniform points
-        t_uniform, y_uniform, z_uniform = self.base_sampler.sample_interior(
-            n_uniform, device, dtype
-        )
+        if self.base_sampler.time_stratified.get('enabled', False):
+            t_uniform, y_uniform, z_uniform = self.base_sampler.sample_interior_stratified(
+                n_uniform, device, dtype
+            )
+        else:
+            t_uniform, y_uniform, z_uniform = self.base_sampler.sample_interior(
+                n_uniform, device, dtype
+            )
         
         # Add noise to adaptive points to explore nearby regions
         t_adapt, y_adapt, z_adapt = self.adaptive_points

@@ -92,8 +92,125 @@ class PINNLoss:
         self.w_vreg = weights.get('vreg', 0.0)
         self.v_threshold = config.get('training', {}).get('v_threshold', 5.0)
 
+        # Causal weighting for time-dependent PDE residuals
+        causal_cfg = config.get('training', {}).get('full', {}).get('causal_weighting', {})
+        self.causal_enabled = causal_cfg.get('enabled', False)
+        self.causal_epsilon = float(causal_cfg.get('epsilon', 1.0))
+        self.causal_min_weight = float(causal_cfg.get('min_weight', 1e-3))
+        self.causal_mode = causal_cfg.get('mode', 'early')
+
+        # Optional anti-trivial anchor to discourage decay to equilibrium branch
+        anti_cfg = config.get('training', {}).get('full', {}).get('anti_trivial_anchor', {})
+        self.anti_trivial_enabled = anti_cfg.get('enabled', False)
+        self.anti_tau = float(anti_cfg.get('tau', 5.77))
+        self.anti_t_max = float(anti_cfg.get('t_max', 10.0))
+        self.anti_weight = float(anti_cfg.get('weight', 0.1))
+        self.anti_mode = anti_cfg.get('mode', 'max_vmag')
+        self.anti_min_fraction = float(anti_cfg.get('min_fraction', 1.0))
+        self.epsilon = float(config.get('physics', {}).get('epsilon', 0.2))
+
+        # Scale-aware weighting (emphasize high |z| early)
+        scale_cfg = config.get('training', {}).get('full', {}).get('scale_weighting', {})
+        self.scale_enabled = scale_cfg.get('enabled', False)
+        self.scale_alpha = float(scale_cfg.get('alpha', 1.0))
+        self.scale_t_max = float(scale_cfg.get('t_max', 10.0))
+        self.scale_power = float(scale_cfg.get('power', 1.0))
+        self.scale_z_max = float(config.get('domain', {}).get('z_max', 1.0))
+
+        # Residual normalization by local physical scales
+        norm_cfg = config.get('training', {}).get('full', {}).get('residual_normalization', {})
+        self.res_norm_enabled = norm_cfg.get('enabled', False)
+        self.rho_floor = float(norm_cfg.get('rho_floor', 1e-3))
+
+    def _causal_weight(
+        self,
+        t: torch.Tensor,
+        current_t_horizon: Optional[float],
+    ) -> torch.Tensor:
+        """
+        Compute simple causal weights favoring earlier-time residual reduction first.
+        """
+        if (not self.causal_enabled) or current_t_horizon is None:
+            return torch.ones_like(t)
+
+        horizon_val = max(float(current_t_horizon), 1e-6)
+        horizon = torch.as_tensor(horizon_val, device=t.device, dtype=t.dtype)
+
+        if self.causal_mode == 'late':
+            dt = torch.clamp(horizon - t, min=0.0)
+            weights = torch.exp(-self.causal_epsilon * dt)
+        else:
+            t_norm = torch.clamp(t / horizon, min=0.0, max=1.0)
+            weights = torch.exp(-self.causal_epsilon * t_norm)
+        weights = torch.clamp(weights, min=self.causal_min_weight)
+        weights = weights / (weights.mean() + 1e-12)
+        return weights
+
+    def _scale_weight(
+        self,
+        t: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Weight residuals toward high |z| early in time.
+        """
+        if not self.scale_enabled:
+            return torch.ones_like(t)
+
+        z_norm = torch.clamp(torch.abs(z) / self.scale_z_max, min=0.0, max=1.0)
+        z_factor = z_norm**self.scale_power
+        t_factor = torch.clamp(1.0 - t / self.scale_t_max, min=0.0, max=1.0)
+        return 1.0 + self.scale_alpha * t_factor * z_factor
+
+    def _anti_trivial_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Penalize early-time collapse by requiring growth of velocity envelope.
+        """
+        if not self.anti_trivial_enabled:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        mask = t <= self.anti_t_max
+        if not torch.any(mask):
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        t_early = t[mask]
+        vy_early = outputs['vy'][mask]
+        vz_early = outputs['vz'][mask]
+        y_early = y[mask]
+        z_early = z[mask]
+
+        expected = self.epsilon * torch.exp(t_early / self.anti_tau)
+
+        if self.anti_mode == 'projection':
+            phi = torch.sin(np.pi * y_early / self.physics.Y_half) * \
+                  torch.cos(np.pi * z_early / (2.0 * self.physics.Z_top))
+            denom = torch.mean(phi**2) + 1e-12
+            A_hat = -torch.mean(vz_early * phi) / denom
+            expected_amp = torch.mean(expected)
+            deficit = torch.relu(self.anti_min_fraction * expected_amp - torch.abs(A_hat))
+            return deficit**2
+
+        if self.anti_mode == 'mode_envelope':
+            phi = torch.sin(np.pi * y_early / self.physics.Y_half) * \
+                  torch.cos(np.pi * z_early / (2.0 * self.physics.Z_top))
+            target = self.anti_min_fraction * expected * torch.abs(phi)
+            deficit = torch.relu(target - torch.abs(vz_early))
+            return torch.mean(deficit**2)
+
+        # Default: max vmag anchor
+        v_early = torch.sqrt(vy_early**2 + vz_early**2)
+        deficit = torch.relu(torch.max(expected) - torch.max(v_early))
+        return deficit**2
+
     def compute_pde_loss(self, model: ParkerPINN, t: torch.Tensor,
-                         y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, Dict, Dict]:
+                         y: torch.Tensor, z: torch.Tensor,
+                         current_t_horizon: Optional[float] = None) -> Tuple[torch.Tensor, Dict, Dict]:
         """
         Compute PDE residual loss.
 
@@ -111,9 +228,21 @@ class PINNLoss:
             derivatives
         )
 
-        loss_continuity = torch.mean(residuals['continuity']**2)
-        loss_momentum_y = torch.mean(residuals['momentum_y']**2)
-        loss_momentum_z = torch.mean(residuals['momentum_z']**2)
+        causal_w = self._causal_weight(t, current_t_horizon)
+        scale_w = self._scale_weight(t, z)
+        w = causal_w * scale_w
+
+        if self.res_norm_enabled:
+            rho_scale = outputs['rho'] + self.rho_floor
+            res_mom_y = residuals['momentum_y'] / rho_scale
+            res_mom_z = residuals['momentum_z'] / rho_scale
+        else:
+            res_mom_y = residuals['momentum_y']
+            res_mom_z = residuals['momentum_z']
+
+        loss_continuity = torch.mean((w * residuals['continuity'])**2)
+        loss_momentum_y = torch.mean((w * res_mom_y)**2)
+        loss_momentum_z = torch.mean((w * res_mom_z)**2)
 
         if self.use_Ax:
             res_induction = self.physics.compute_induction_Ax_residual(
@@ -125,11 +254,12 @@ class PINNLoss:
                 derivatives['vy_y'], derivatives['vy_z'],
                 derivatives['vz_y'], derivatives['vz_z'],
             )
-            loss_induction = torch.mean(res_induction**2)
+            loss_induction = torch.mean((w * res_induction)**2)
             loss_divB = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         else:
-            loss_induction = torch.mean(residuals['induction_y']**2) + torch.mean(residuals['induction_z']**2)
-            loss_divB = torch.mean(residuals['divB']**2)
+            loss_induction = torch.mean((w * residuals['induction_y'])**2) + \
+                             torch.mean((w * residuals['induction_z'])**2)
+            loss_divB = torch.mean((w * residuals['divB'])**2)
 
         total_pde = (
             self.w_continuity * loss_continuity
@@ -145,7 +275,13 @@ class PINNLoss:
             'momentum_z': loss_momentum_z,
             'induction': loss_induction,
             'divB': loss_divB,
-            'pde_total': total_pde
+            'pde_total': total_pde,
+            'causal_w_mean': causal_w.mean(),
+            'causal_w_min': causal_w.min(),
+            'causal_w_max': causal_w.max(),
+            'scale_w_mean': scale_w.mean(),
+            'scale_w_min': scale_w.min(),
+            'scale_w_max': scale_w.max(),
         }
 
         return total_pde, losses, outputs
@@ -183,6 +319,28 @@ class PINNLoss:
         losses['ic_total'] = total
         return self.w_ic * total, losses
 
+    def _boundary_quantities(
+        self,
+        model: ParkerPINN,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Evaluate boundary fields and derivatives needed by BC constraints.
+        """
+        outputs, derivatives = model.compute_derivatives(t, y, z)
+        result = {
+            'vz': outputs['vz'],
+            'Bz': outputs['Bz'],
+            'rho_z': derivatives['rho_z'],
+            'vy_z': derivatives['vy_z'],
+            'By_z': derivatives['By_z'],
+        }
+        if 'Ax' in outputs:
+            result['Ax'] = outputs['Ax']
+        return result
+
     def compute_bc_loss(self, model: ParkerPINN, sampler: CollocationSampler,
                         n_points: int) -> Tuple[torch.Tensor, Dict]:
         """Compute boundary condition loss."""
@@ -199,30 +357,33 @@ class PINNLoss:
             losses[f'bc_y_{name}'] = loss
             total = total + self.w_bc_y * loss
 
-        # Midplane symmetry at z=0
-        t_z0, y_z0, z_z0 = sampler.sample_bc_z_bottom(n_points, self.device, self.dtype)
-        outputs_z0 = model(t_z0, y_z0, z_z0)
+        # NOTE: We intentionally do not enforce z=0 symmetry constraints here.
+        # Basu's midplane-crossing mode allows crossing motions, so hard midplane
+        # symmetry losses can over-constrain dynamics in full-domain training.
 
-        loss_vz = torch.mean(outputs_z0['vz']**2)
-        losses['bc_z0_vz'] = loss_vz
-        total = total + self.w_bc_z_bottom * loss_vz
+        # Lower rigid lid at z=z_min (Basu setup)
+        t_zL, y_zL, z_zL = sampler.sample_bc_z_lower(n_points, self.device, self.dtype)
+        bc_lower = self._boundary_quantities(model, t_zL, y_zL, z_zL)
 
-        if self.use_Ax:
-            loss_Ax = torch.mean(outputs_z0['Ax']**2)
-            losses['bc_z0_Ax'] = loss_Ax
-            total = total + self.w_bc_z_bottom * loss_Ax
-        else:
-            loss_Bz = torch.mean(outputs_z0['Bz']**2)
-            losses['bc_z0_Bz'] = loss_Bz
-            total = total + self.w_bc_z_bottom * loss_Bz
+        loss_zL_vz = torch.mean(bc_lower['vz']**2)
+        loss_zL_Bz = torch.mean(bc_lower['Bz']**2)
+        loss_zL_By_z = torch.mean(bc_lower['By_z']**2)
+        losses['bc_zL_vz'] = loss_zL_vz
+        losses['bc_zL_Bz'] = loss_zL_Bz
+        losses['bc_zL_By_z'] = loss_zL_By_z
+        total = total + self.w_bc_z_bottom * (loss_zL_vz + loss_zL_Bz + loss_zL_By_z)
 
-        # Top boundary
+        # Upper rigid lid at z=z_max
         t_zT, y_zT, z_zT = sampler.sample_bc_z_top(n_points, self.device, self.dtype)
-        outputs_zT = model(t_zT, y_zT, z_zT)
+        bc_top = self._boundary_quantities(model, t_zT, y_zT, z_zT)
 
-        loss_vz_top = torch.mean(outputs_zT['vz']**2)
-        losses['bc_zT_vz'] = loss_vz_top
-        total = total + self.w_bc_z_top * loss_vz_top
+        loss_zT_vz = torch.mean(bc_top['vz']**2)
+        loss_zT_Bz = torch.mean(bc_top['Bz']**2)
+        loss_zT_By_z = torch.mean(bc_top['By_z']**2)
+        losses['bc_zT_vz'] = loss_zT_vz
+        losses['bc_zT_Bz'] = loss_zT_Bz
+        losses['bc_zT_By_z'] = loss_zT_By_z
+        total = total + self.w_bc_z_top * (loss_zT_vz + loss_zT_Bz + loss_zT_By_z)
 
         losses['bc_total'] = total
         return total, losses
@@ -230,12 +391,15 @@ class PINNLoss:
     def __call__(self, model: ParkerPINN,
                  t_pde: torch.Tensor, y_pde: torch.Tensor, z_pde: torch.Tensor,
                  t_ic: torch.Tensor, y_ic: torch.Tensor, z_ic: torch.Tensor,
-                 sampler: CollocationSampler, n_bc: int) -> Tuple[torch.Tensor, Dict]:
+                 sampler: CollocationSampler, n_bc: int,
+                 current_t_horizon: Optional[float] = None) -> Tuple[torch.Tensor, Dict]:
         """Compute total loss."""
         all_losses = {}
 
         # PDE + outputs 
-        pde_loss, pde_losses, outputs_pde = self.compute_pde_loss(model, t_pde, y_pde, z_pde)
+        pde_loss, pde_losses, outputs_pde = self.compute_pde_loss(
+            model, t_pde, y_pde, z_pde, current_t_horizon=current_t_horizon
+        )
         all_losses.update(pde_losses)
 
         # Velocity regularization 
@@ -250,8 +414,12 @@ class PINNLoss:
         bc_loss, bc_losses = self.compute_bc_loss(model, sampler, n_bc)
         all_losses.update(bc_losses)
 
+        # Anti-trivial anchor
+        anti_trivial = self._anti_trivial_loss(outputs_pde, t_pde, y_pde, z_pde)
+        all_losses['anti_trivial'] = anti_trivial
+
         # Total
-        total = pde_loss + ic_loss + bc_loss + self.w_vreg * vreg_loss
+        total = pde_loss + ic_loss + bc_loss + self.w_vreg * vreg_loss + self.anti_weight * anti_trivial
         all_losses['total_loss'] = total
 
         return total, all_losses
@@ -339,7 +507,10 @@ def run_overfit_test(model, config, physics, bc, sampler, device, dtype):
 
     for epoch in range(epochs):
         optimizer.zero_grad()
-        total_loss, _ = loss_fn(model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, n_points // 8)
+        total_loss, _ = loss_fn(
+            model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, n_points // 8,
+            current_t_horizon=config['domain']['t_max']
+        )
         total_loss.backward()
         optimizer.step()
 
@@ -384,6 +555,7 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
 
     for epoch in range(start_epoch, epochs):
         metrics_tracker.start_epoch()
+        current_t_max = config['domain']['t_max']
 
         if curriculum['enabled']:
             progress = min(1.0, epoch / t_grow_epochs)
@@ -393,12 +565,18 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
         if adaptive_sampler.enabled and epoch >= adaptive_sampler.start_epoch:
             t_pde, y_pde, z_pde = adaptive_sampler.sample_with_adaptive(batch_size_coll, device, dtype, epoch)
         else:
-            t_pde, y_pde, z_pde = sampler.sample_interior(batch_size_coll, device, dtype)
+            if sampler.time_stratified.get('enabled', False):
+                t_pde, y_pde, z_pde = sampler.sample_interior_stratified(batch_size_coll, device, dtype)
+            else:
+                t_pde, y_pde, z_pde = sampler.sample_interior(batch_size_coll, device, dtype)
 
         t_ic, y_ic, z_ic = sampler.sample_ic(batch_size_ic, device, dtype)
 
         optimizer.zero_grad()
-        total_loss, losses = loss_fn(model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc)
+        total_loss, losses = loss_fn(
+            model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc,
+            current_t_horizon=current_t_max
+        )
         total_loss.backward()
 
         if grad_clip > 0:
@@ -409,6 +587,58 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+
+        if (
+            adaptive_sampler.enabled
+            and epoch >= adaptive_sampler.start_epoch
+            and epoch % adaptive_sampler.interval == 0
+        ):
+            t_adapt = t_pde.detach().clone()
+            y_adapt = y_pde.detach().clone()
+            z_adapt = z_pde.detach().clone()
+
+            outputs_adapt, derivs_adapt = model.compute_derivatives(t_adapt, y_adapt, z_adapt)
+            residuals_adapt = physics.compute_pde_residuals(
+                t_adapt, y_adapt, z_adapt,
+                outputs_adapt['rho'], outputs_adapt['vy'], outputs_adapt['vz'],
+                outputs_adapt['By'], outputs_adapt['Bz'],
+                derivs_adapt
+            )
+
+            if config['network']['use_Ax_potential']:
+                res_induction = physics.compute_induction_Ax_residual(
+                    t_adapt, y_adapt, z_adapt,
+                    outputs_adapt['vy'], outputs_adapt['vz'], outputs_adapt['Ax'],
+                    derivs_adapt['Ax_t'], derivs_adapt['Ax_y'], derivs_adapt['Ax_z'],
+                    derivs_adapt.get('Ax_yy', torch.zeros_like(t_adapt)),
+                    derivs_adapt.get('Ax_zz', torch.zeros_like(t_adapt)),
+                    derivs_adapt['vy_y'], derivs_adapt['vy_z'],
+                    derivs_adapt['vz_y'], derivs_adapt['vz_z'],
+                )
+                residual_mag = torch.sqrt(
+                    residuals_adapt['continuity']**2
+                    + residuals_adapt['momentum_y']**2
+                    + residuals_adapt['momentum_z']**2
+                    + res_induction**2
+                )
+            else:
+                residual_mag = torch.sqrt(
+                    residuals_adapt['continuity']**2
+                    + residuals_adapt['momentum_y']**2
+                    + residuals_adapt['momentum_z']**2
+                    + residuals_adapt['induction_y']**2
+                    + residuals_adapt['induction_z']**2
+                    + residuals_adapt['divB']**2
+                )
+
+            n_keep = max(1, int(batch_size_coll * adaptive_sampler.residual_fraction))
+            adaptive_sampler.update_adaptive_points(
+                t_adapt,
+                y_adapt,
+                z_adapt,
+                residual_mag.detach(),
+                n_keep,
+            )
 
         wall_time = metrics_tracker.end_epoch()
 
@@ -443,7 +673,10 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
 
             def closure():
                 lbfgs_opt.zero_grad()
-                loss, _ = loss_fn(model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc)
+                loss, _ = loss_fn(
+                    model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc,
+                    current_t_horizon=current_t_max
+                )
                 loss.backward()
                 return loss
 
@@ -498,12 +731,26 @@ def main():
     if dtype == torch.float64:
         torch.set_default_dtype(torch.float64)
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = Path(__file__).parent / 'runs' / f'{timestamp}_parker'
-    run_dir.mkdir(parents=True, exist_ok=True)
+    runs_root = Path(__file__).parent / 'runs'
+    runs_root.mkdir(parents=True, exist_ok=True)
 
-    with open(run_dir / 'config.yaml', 'w') as f:
-        yaml.dump(config, f)
+    run_dir = None
+    if config['resume'] and not config.get('fresh', False):
+        existing_runs = sorted(
+            [p for p in runs_root.glob('*_parker') if p.is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if existing_runs:
+            run_dir = existing_runs[0]
+            print(f"Using existing run directory for resume: {run_dir}")
+
+    if run_dir is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = runs_root / f'{timestamp}_parker'
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with open(run_dir / 'config.yaml', 'w') as f:
+            yaml.dump(config, f)
 
     physics, bc = create_physics(config)
     model = create_model(config, physics).to(device)

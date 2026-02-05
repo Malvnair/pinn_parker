@@ -139,12 +139,19 @@ class SanityChecker:
         
         Checks: d_z(P + B^2/2) + rho*g_z ≈ 0
         """
-        z = torch.linspace(
-            self.config['domain']['z_min'] + 0.01,  # Avoid z=0 exactly
-            self.config['domain']['z_max'],
-            n_points,
-            device=device, dtype=dtype
-        )
+        z_min = self.config['domain']['z_min']
+        z_max = self.config['domain']['z_max']
+
+        # For full symmetric domains, evaluate on z>0 branch only to avoid
+        # the sign-change cusp at z=0 in |z|-profiles.
+        if z_min < 0.0 < z_max:
+            z_start = 0.01
+            z_end = z_max
+        else:
+            z_start = z_min + 0.01
+            z_end = z_max
+
+        z = torch.linspace(z_start, z_end, n_points, device=device, dtype=dtype)
         y = torch.zeros_like(z)  # Fixed y for 1D check
         
         # Get equilibrium profiles
@@ -163,8 +170,8 @@ class SanityChecker:
         # Gravity
         _, gz = self.physics.gravity(z)
         
-        # Residual
-        residual = dPtot_dz + rho * gz
+        # Residual: d/dz(P+B^2/2) - rho*g_z = 0
+        residual = dPtot_dz - rho * gz
         
         stats = {
             'equilibrium_residual_max': residual.abs().max().item(),

@@ -76,9 +76,15 @@ class ParkerPhysics:
         return self.cs_nd**2 * rho
     
     def initial_By(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Initial By - EQUILIBRIUM ONLY, no perturbation."""
+        """
+        Initial By enforcing constant alpha = B^2/(2P).
+
+        With rho(z) = rho0 * exp(-|z|/H) and P = cs^2 * rho,
+        By(z) = sqrt(2 * alpha * cs^2 * rho(z)) ensures alpha is constant pointwise.
+        """
         absz = torch.abs(z)
-        return self.B0_nd * torch.exp(-absz / (2.0 * self.H_nd))
+        rho = self.rho0_nd * torch.exp(-absz / self.H_nd)
+        return torch.sqrt(2.0 * self.alpha * self.cs_nd**2 * rho)
 
     
     def initial_Bz(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -89,12 +95,21 @@ class ParkerPhysics:
     
     def initial_Ax(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """
-        Initial Ax - EQUILIBRIUM ONLY.
-        Uses Ax(0)=0 and odd parity across midplane if ever evaluated for z<0.
+        Initial Ax such that By = dAx/dz exactly for the constant-alpha By profile.
+
+        With By(z) = By0 * exp(-|z|/(2H)), integrating gives:
+            Ax(z) = -2H * By0 * exp(-|z|/(2H))
+
+        Odd parity across z=0 is enforced so that By = dAx/dz is even (correct sign).
         """
         absz = torch.abs(z)
-        Ax = -2.0 * self.H_nd * self.B0_nd * (torch.exp(-absz / (2.0 * self.H_nd)) - 1.0)
-        Ax = torch.where(z >= 0, Ax, -Ax)
+        By0 = torch.sqrt(torch.tensor(
+            2.0 * self.alpha * self.cs_nd**2 * self.rho0_nd,
+            dtype=z.dtype, device=z.device
+        ))
+        Ax = -2.0 * self.H_nd * By0 * torch.exp(-absz / (2.0 * self.H_nd))
+        # Odd parity: Ax(z) for z >= 0, -Ax(|z|) for z < 0
+        Ax = torch.where(z >= 0.0, Ax, -Ax)
         return Ax
 
     
@@ -106,38 +121,46 @@ class ParkerPhysics:
     def initial_vz(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """
         Initial vz perturbation (ONLY perturbation).
-        Use sine in z so that vz(z=0)=0 (odd midplane symmetry).
+        Basu et al. (1997), Eq. (4):
+            vz = -epsilon * cs * cos(pi z / (2 Z_top)) * sin(pi y / Y_half)
         """
         return -self.epsilon * self.cs_nd * \
-            torch.sin(np.pi * z / (2.0 * self.Z_top)) * \
+            torch.cos(np.pi * z / (2.0 * self.Z_top)) * \
             torch.sin(np.pi * y / self.Y_half)
     
     def gravity(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        External gravity field.
-        
-        g = (0, g_z) where g_z = -g0 * sign(z)
-        
-        For upper half domain (z > 0): g_z = -g0
-        At z = 0: we use g_z = 0 (or small value for smoothness)
+        Symmetric full-domain gravity for stratification with |z|.
+
+        g_z = -g0 * sign(z), with g_z(0) = 0.
+
+        This points downward (toward midplane) on both sides of z=0.
         """
         gy = torch.zeros_like(z)
-        # Use smooth approximation to sign function for training stability
-        delta = 0.01  # Smoothing parameter
-        gz = -self.g0_nd * torch.tanh(z / delta)
-        
-        
+        gz = -self.g0_nd * torch.sign(z)
+        # Explicitly set gz=0 at midplane
+        gz = torch.where(z == 0.0, torch.zeros_like(gz), gz)
         return gy, gz
     
     def get_initial_conditions(self, y: torch.Tensor, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Get all initial condition values.
-        
+        Get all initial condition values (legacy name).
+
         Returns:
-            Dictionary with rho, vy, vz, By, Bz, Ax
+            Dictionary with rho, P, vy, vz, By, Bz, Ax
+        """
+        return self.initial_conditions(y, z)
+
+    def initial_conditions(self, y: torch.Tensor, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Get all initial condition values.
+
+        Returns:
+            Dictionary with rho, P, vy, vz, By, Bz, Ax
         """
         return {
             'rho': self.initial_density(y, z),
+            'P': self.initial_pressure(y, z),
             'vy': self.initial_vy(y, z),
             'vz': self.initial_vz(y, z),
             'By': self.initial_By(y, z),
@@ -291,51 +314,46 @@ class ParkerPhysics:
         z: torch.Tensor,
         rho: torch.Tensor,
         By: torch.Tensor,
-        epsilon: float = 0.0
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, float]:
         """
-        Check vertical hydrostatic–magnetostatic equilibrium at t = 0.
+        Check magnetohydrostatic equilibrium: d/dz(P + B^2/2) - rho*g_z = 0.
 
-        The equilibrium condition is
+        Equivalently: d/dz(P + B^2/2) + rho*g_down = 0 with g_down = -g_z.
 
-            d/dz ( P + B^2 / 2 ) + rho * g_z = 0 ,
+        With constant-alpha profiles this is exact on each side of the midplane.
+        Numerically check away from z=0 (or split z>0 / z<0) to get ~machine precision.
 
-        with an isothermal equation of state P = c_s^2 rho and magnetic pressure
-        B_y^2 / 2 = alpha P, giving
+        Args:
+            z: 1D tensor of z coordinates
+            rho: density at those z values
+            By: horizontal magnetic field at those z values
 
-            P_tot = (1 + alpha) c_s^2 rho .
-
-        For constant gravity g_z = -g0 and
-        rho(z) = rho_0 exp(-z / H), equilibrium is satisfied when
-
-            H = (1 + alpha) c_s^2 / g0 .
-
-        This routine numerically evaluates the residual of the equilibrium
-        condition to verify consistency.
+        Returns:
+            Dictionary with diagnostic metrics:
+            - residual_max_abs: maximum absolute residual
+            - residual_mean_abs: mean absolute residual
+            - residual_rms: root-mean-square residual
+            - alpha_min: minimum computed alpha = B^2/(2P)
+            - alpha_max: maximum computed alpha = B^2/(2P)
         """
-
-        # Compute gradients numerically
-        dz = z[1] - z[0] if len(z) > 1 else 0.01
-        
         P = self.cs_nd**2 * rho
-        Pmag = By**2 / 2.0
+        Pmag = 0.5 * By**2
         Ptot = P + Pmag
-        
-        # Numerical derivative
-        if len(z.shape) == 1:
-            dPtot_dz = torch.gradient(Ptot, spacing=(dz,))[0]
-        else:
-            dPtot_dz = torch.zeros_like(Ptot)
-        
+
+        # Use scalar spacing for broad torch compatibility
+        dz = z[1] - z[0]
+        dPtot_dz = torch.gradient(Ptot, spacing=(dz.item(),))[0]
+
         _, gz = self.gravity(z)
-        
-        # Residual should be zero in equilibrium
-        equilibrium_residual = dPtot_dz + rho * gz
-        
+        # Residual: d/dz(Ptot) - rho*gz = 0 in equilibrium
+        residual = dPtot_dz - rho * gz
+
         return {
-            'residual': equilibrium_residual,
-            'Ptot': Ptot,
-            'rho_gz': rho * gz,
+            'residual_max_abs': residual.abs().max().item(),
+            'residual_mean_abs': residual.abs().mean().item(),
+            'residual_rms': torch.sqrt(torch.mean(residual**2)).item(),
+            'alpha_min': (By**2 / (2.0 * P)).min().item(),
+            'alpha_max': (By**2 / (2.0 * P)).max().item(),
         }
 
 
