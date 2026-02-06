@@ -280,25 +280,39 @@ class ParkerPINN(nn.Module):
             vy_ic = self.physics.initial_vy(y, z)
             vz_ic = self.physics.initial_vz(y, z)
             
-            # Output transform: out = IC + t * NN_correction
-            # This ensures exact IC at t=0
+            # === Output transform redesigned for instability growth ===
+            #
+            # Key insight: the old transform rho = rho_ic * exp(t*tanh(raw)/10)
+            # suppresses perturbation growth by requiring raw ~ O(10) for O(1)
+            # density changes.  The linear velocity form vz = vz_ic + t*raw
+            # requires the network to learn exp(t/tau)/t which is unnecessarily
+            # hard.
+            #
+            # New approach: use (1-exp(-t/sigma))*NN as the correction, where
+            # sigma is a learnable or fixed ramp time.  This gives:
+            #   - exact IC at t=0  (correction vanishes)
+            #   - smooth ramp-on   (no t-discontinuity in derivatives)
+            #   - raw NN output directly controls the perturbation amplitude
+            #     at t >> sigma, without artificial suppression
+            #
+            # For density we keep multiplicative form for positivity.
             
-            # Density: use multiplicative form for positivity
-            # rho = rho_ic * exp(t * sigmoid(rho_raw) - t/2)
-            # At t=0: rho = rho_ic
-            # rho = rho_ic * (1 + t * tanh(rho_raw))
-            # Better: rho = rho_ic * exp(t * rho_raw / scale)
-            scale = 10.0
-            rho = rho_ic * torch.exp(t * torch.tanh(rho_raw) / scale)
-            rho = torch.clamp(rho, min=1e-6)  # Ensure positivity
+            sigma = 1.0  # Ramp time scale (~ fraction of growth time)
+            ramp = 1.0 - torch.exp(-t / sigma)  # 0 at t=0, ~1 for t >> sigma
             
-            # Velocities: additive form
-            vy = vy_ic + t * vy_raw
-            vz = vz_ic + t * vz_raw
+            # Density: multiplicative form, no tanh saturation
+            # rho = rho_ic * exp(ramp * rho_raw)
+            # At t=0: ramp=0 => rho = rho_ic.  Raw output directly sets log-perturbation.
+            rho = rho_ic * torch.exp(ramp * rho_raw)
+            rho = torch.clamp(rho, min=1e-6)
+            
+            # Velocities: additive with smooth ramp
+            vy = vy_ic + ramp * vy_raw
+            vz = vz_ic + ramp * vz_raw
             
             if self.use_Ax:
                 Ax_ic = self.physics.initial_Ax(y, z)
-                Ax = Ax_ic + t * Ax_raw
+                Ax = Ax_ic + ramp * Ax_raw
                 
                 return {
                     'rho': rho,
@@ -309,8 +323,8 @@ class ParkerPINN(nn.Module):
             else:
                 By_ic = self.physics.initial_By(y, z)
                 Bz_ic = self.physics.initial_Bz(y, z)
-                By = By_ic + t * By_raw
-                Bz = Bz_ic + t * Bz_raw
+                By = By_ic + ramp * By_raw
+                Bz = Bz_ic + ramp * Bz_raw
                 
                 return {
                     'rho': rho,

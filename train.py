@@ -109,6 +109,25 @@ class PINNLoss:
         self.anti_min_fraction = float(anti_cfg.get('min_fraction', 1.0))
         self.epsilon = float(config.get('physics', {}).get('epsilon', 0.2))
 
+        # Eigenmode anchor based on linear theory growth
+        eigen_cfg = config.get('training', {}).get('full', {}).get('eigenmode_anchor', {})
+        self.eigen_enabled = eigen_cfg.get('enabled', False)
+        self.eigen_weight = float(eigen_cfg.get('weight', 1.0))
+        self.eigen_tau = float(eigen_cfg.get('tau', 5.77))
+        self.eigen_times = eigen_cfg.get('times', [2.0, 5.0, 8.0, 10.0])
+        self.eigen_window = float(eigen_cfg.get('window', 0.5))
+        self.eigen_min_points = int(eigen_cfg.get('min_points', 64))
+
+        # Density mode anchor (valley-enhancing even mode)
+        rho_cfg = config.get('training', {}).get('full', {}).get('density_anchor', {})
+        self.rho_anchor_enabled = rho_cfg.get('enabled', False)
+        self.rho_anchor_weight = float(rho_cfg.get('weight', 1.0))
+        self.rho_anchor_tau = float(rho_cfg.get('tau', 5.77))
+        self.rho_anchor_times = rho_cfg.get('times', [5.0, 8.0, 10.0, 12.0, 15.0, 18.0])
+        self.rho_anchor_window = float(rho_cfg.get('window', 0.5))
+        self.rho_anchor_min_points = int(rho_cfg.get('min_points', 64))
+        self.rho_anchor_fraction = float(rho_cfg.get('fraction', 0.1))
+
         # Scale-aware weighting (emphasize high |z| early)
         scale_cfg = config.get('training', {}).get('full', {}).get('scale_weighting', {})
         self.scale_enabled = scale_cfg.get('enabled', False)
@@ -128,20 +147,31 @@ class PINNLoss:
         current_t_horizon: Optional[float],
     ) -> torch.Tensor:
         """
-        Compute simple causal weights favoring earlier-time residual reduction first.
+        Compute causal weights for PDE residuals.
+
+        Modes:
+          'early'  — down-weight later times (standard causal training)
+          'late'   — up-weight later times (encourages growth propagation)
+          'growth' — weight ~ exp(+eps*t/T) so growing modes get more attention
         """
         if (not self.causal_enabled) or current_t_horizon is None:
             return torch.ones_like(t)
 
         horizon_val = max(float(current_t_horizon), 1e-6)
         horizon = torch.as_tensor(horizon_val, device=t.device, dtype=t.dtype)
+        t_norm = torch.clamp(t / horizon, min=0.0, max=1.0)
 
         if self.causal_mode == 'late':
-            dt = torch.clamp(horizon - t, min=0.0)
-            weights = torch.exp(-self.causal_epsilon * dt)
+            # Up-weight later times: w ~ exp(+eps * t/T)
+            weights = torch.exp(self.causal_epsilon * t_norm)
+        elif self.causal_mode == 'growth':
+            # Bell-curve: emphasize the intermediate growth window
+            # Peak around t_norm = 0.5, width controlled by epsilon
+            weights = torch.exp(-self.causal_epsilon * (t_norm - 0.5)**2)
         else:
-            t_norm = torch.clamp(t / horizon, min=0.0, max=1.0)
+            # 'early': down-weight later times (original behavior)
             weights = torch.exp(-self.causal_epsilon * t_norm)
+
         weights = torch.clamp(weights, min=self.causal_min_weight)
         weights = weights / (weights.mean() + 1e-12)
         return weights
@@ -170,7 +200,20 @@ class PINNLoss:
         z: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Penalize early-time collapse by requiring growth of velocity envelope.
+        Mode-tracking loss: enforce that the projected eigenmode amplitude
+        follows A(t) ~ epsilon * exp(t/tau) during the linear growth phase.
+
+        Strategy: bin collocation points by time, project vz onto the
+        eigenmode shape function in each bin, compare against expected
+        exponential growth.  This is much stronger than the old envelope
+        constraint because it enforces the *correct growth rate* rather
+        than just "something nonzero".
+
+        Modes:
+          'mode_tracking' — binned projection with log-space comparison
+          'mode_envelope'  — pointwise lower bound (original, weaker)
+          'projection'    — single bulk projection (original)
+          default         — max vmag (original, weakest)
         """
         if not self.anti_trivial_enabled:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
@@ -179,34 +222,171 @@ class PINNLoss:
         if not torch.any(mask):
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
-        t_early = t[mask]
-        vy_early = outputs['vy'][mask]
-        vz_early = outputs['vz'][mask]
-        y_early = y[mask]
-        z_early = z[mask]
+        t_m = t[mask]
+        vz_m = outputs['vz'][mask]
+        y_m = y[mask]
+        z_m = z[mask]
 
-        expected = self.epsilon * torch.exp(t_early / self.anti_tau)
+        Y_half = self.physics.Y_half
+        Z_top = self.physics.Z_top
+        phi = torch.sin(np.pi * y_m / Y_half) * \
+              torch.cos(np.pi * z_m / (2.0 * Z_top))
 
-        if self.anti_mode == 'projection':
-            phi = torch.sin(np.pi * y_early / self.physics.Y_half) * \
-                  torch.cos(np.pi * z_early / (2.0 * self.physics.Z_top))
+        if self.anti_mode == 'mode_tracking':
+            # Bin by time and compare projected amplitude vs expected
+            n_bins = 8
+            t_lo = t_m.min()
+            t_hi = t_m.max()
+            if t_hi - t_lo < 0.1:
+                return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+            bin_edges = torch.linspace(float(t_lo.detach()), float(t_hi.detach()), n_bins + 1,
+                                       device=self.device, dtype=self.dtype)
+            loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            n_valid = 0
+
+            for i in range(n_bins):
+                bin_mask = (t_m >= bin_edges[i]) & (t_m < bin_edges[i + 1])
+                if bin_mask.sum() < 10:
+                    continue
+
+                phi_bin = phi[bin_mask]
+                vz_bin = vz_m[bin_mask]
+                t_bin_mean = t_m[bin_mask].mean()
+
+                # Project: A_hat = -<vz * phi> / <phi^2>
+                denom = torch.mean(phi_bin**2) + 1e-12
+                A_hat = -torch.mean(vz_bin * phi_bin) / denom
+
+                # Expected amplitude
+                A_expected = self.epsilon * torch.exp(t_bin_mean / self.anti_tau)
+
+                # Compare in log space to treat all time bins equally
+                # Only penalize if amplitude is *below* expected
+                log_hat = torch.log(torch.abs(A_hat) + 1e-10)
+                log_exp = torch.log(self.anti_min_fraction * A_expected + 1e-10)
+
+                deficit = torch.relu(log_exp - log_hat)
+                loss = loss + deficit**2
+                n_valid += 1
+
+            if n_valid > 0:
+                loss = loss / n_valid
+            return loss
+
+        elif self.anti_mode == 'mode_envelope':
+            # Pointwise lower bound (original)
+            expected = self.epsilon * torch.exp(t_m / self.anti_tau)
+            target = self.anti_min_fraction * expected * torch.abs(phi)
+            deficit = torch.relu(target - torch.abs(vz_m))
+            return torch.mean(deficit**2)
+
+        elif self.anti_mode == 'projection':
             denom = torch.mean(phi**2) + 1e-12
-            A_hat = -torch.mean(vz_early * phi) / denom
-            expected_amp = torch.mean(expected)
+            A_hat = -torch.mean(vz_m * phi) / denom
+            expected_amp = self.epsilon * torch.mean(torch.exp(t_m / self.anti_tau))
             deficit = torch.relu(self.anti_min_fraction * expected_amp - torch.abs(A_hat))
             return deficit**2
 
-        if self.anti_mode == 'mode_envelope':
-            phi = torch.sin(np.pi * y_early / self.physics.Y_half) * \
-                  torch.cos(np.pi * z_early / (2.0 * self.physics.Z_top))
-            target = self.anti_min_fraction * expected * torch.abs(phi)
-            deficit = torch.relu(target - torch.abs(vz_early))
-            return torch.mean(deficit**2)
+        else:
+            # max vmag anchor (weakest)
+            vy_m = outputs['vy'][mask]
+            v_early = torch.sqrt(vy_m**2 + vz_m**2)
+            expected = self.epsilon * torch.exp(t_m / self.anti_tau)
+            deficit = torch.relu(torch.max(expected) - torch.max(v_early))
+            return deficit**2
 
-        # Default: max vmag anchor
-        v_early = torch.sqrt(vy_early**2 + vz_early**2)
-        deficit = torch.relu(torch.max(expected) - torch.max(v_early))
-        return deficit**2
+    def _eigenmode_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Enforce linear-theory growth of the undular mode at fixed time slices.
+        """
+        if not self.eigen_enabled:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        vz = outputs['vz']
+        total = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        n_used = 0
+
+        for t0 in self.eigen_times:
+            t0_val = float(t0)
+            mask = torch.abs(t - t0_val) <= self.eigen_window
+            if torch.count_nonzero(mask) < self.eigen_min_points:
+                continue
+
+            y_m = y[mask]
+            z_m = z[mask]
+            vz_m = vz[mask]
+
+            phi = torch.sin(np.pi * y_m / self.physics.Y_half) * \
+                  torch.cos(np.pi * z_m / (2.0 * self.physics.Z_top))
+            denom = torch.mean(phi**2) + 1e-12
+            A_hat = -torch.mean(vz_m * phi) / denom
+            A_target = self.epsilon * torch.exp(
+                torch.tensor(t0_val, device=self.device, dtype=self.dtype) / self.eigen_tau
+            )
+
+            total = total + (A_hat - A_target)**2
+            n_used += 1
+
+        if n_used == 0:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        return total / n_used
+
+    def _density_mode_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encourage density perturbation growth in the even (valley-enhancing) mode.
+        """
+        if not self.rho_anchor_enabled:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        rho = outputs['rho']
+        rho_ic = self.physics.initial_density(y, z)
+        rho_pert = rho - rho_ic
+
+        total = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        n_used = 0
+
+        for t0 in self.rho_anchor_times:
+            t0_val = float(t0)
+            mask = torch.abs(t - t0_val) <= self.rho_anchor_window
+            if torch.count_nonzero(mask) < self.rho_anchor_min_points:
+                continue
+
+            y_m = y[mask]
+            z_m = z[mask]
+            rho_m = rho_pert[mask]
+
+            # Even mode in y (valley enhancement) and even in z
+            phi = torch.cos(np.pi * y_m / self.physics.Y_half) * \
+                  torch.cos(np.pi * z_m / (2.0 * self.physics.Z_top))
+            denom = torch.mean(phi**2) + 1e-12
+            A_hat = torch.mean(rho_m * phi) / denom
+
+            A_target = self.rho_anchor_fraction * self.epsilon * torch.exp(
+                torch.tensor(t0_val, device=self.device, dtype=self.dtype) / self.rho_anchor_tau
+            )
+
+            deficit = torch.relu(A_target - A_hat)
+            total = total + deficit**2
+            n_used += 1
+
+        if n_used == 0:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        return total / n_used
 
     def compute_pde_loss(self, model: ParkerPINN, t: torch.Tensor,
                          y: torch.Tensor, z: torch.Tensor,
@@ -418,8 +598,24 @@ class PINNLoss:
         anti_trivial = self._anti_trivial_loss(outputs_pde, t_pde, y_pde, z_pde)
         all_losses['anti_trivial'] = anti_trivial
 
+        # Eigenmode anchor (linear theory projection at fixed times)
+        eigen_loss = self._eigenmode_loss(outputs_pde, t_pde, y_pde, z_pde)
+        all_losses['eigenmode'] = eigen_loss
+
+        # Density mode anchor (valley enhancement)
+        rho_anchor = self._density_mode_loss(outputs_pde, t_pde, y_pde, z_pde)
+        all_losses['rho_anchor'] = rho_anchor
+
         # Total
-        total = pde_loss + ic_loss + bc_loss + self.w_vreg * vreg_loss + self.anti_weight * anti_trivial
+        total = (
+            pde_loss
+            + ic_loss
+            + bc_loss
+            + self.w_vreg * vreg_loss
+            + self.anti_weight * anti_trivial
+            + self.eigen_weight * eigen_loss
+            + self.rho_anchor_weight * rho_anchor
+        )
         all_losses['total_loss'] = total
 
         return total, all_losses
@@ -538,8 +734,25 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
     batch_size_coll = train_config['batch_size_collocation']
     batch_size_ic = train_config['batch_size_ic']
     batch_size_bc = train_config['batch_size_bc']
+    val_cfg = train_config.get('validation', {})
+    val_enabled = val_cfg.get('enabled', False)
+    val_every = int(val_cfg.get('every', config['logging']['interval']))
 
     loss_fn = PINNLoss(config, physics, bc, device, dtype)
+    val_data = None
+    if val_enabled:
+        import numpy as _np
+        state = _np.random.get_state()
+        _np.random.seed(12345)
+        n_val = int(val_cfg.get('n_collocation', 2048))
+        t_max_val = val_cfg.get('t_max', sampler.t_max)
+        t_np, y_np, z_np = sampler._sample_interior_np(n_val, sampler.t_min, min(t_max_val, sampler.t_max))
+        _np.random.set_state(state)
+        val_data = (
+            torch.tensor(t_np, device=device, dtype=dtype),
+            torch.tensor(y_np, device=device, dtype=dtype),
+            torch.tensor(z_np, device=device, dtype=dtype),
+        )
 
     curriculum = train_config['curriculum']
     t_warm = curriculum['t_warm'] if curriculum['enabled'] else config['domain']['t_max']
@@ -649,11 +862,22 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
         metrics_tracker.update(metrics)
 
         if epoch % config['logging']['interval'] == 0:
+            if val_enabled and (epoch % val_every == 0) and val_data is not None:
+                t_val, y_val, z_val = val_data
+                val_pde, _, _ = loss_fn.compute_pde_loss(
+                    model, t_val, y_val, z_val, current_t_horizon=current_t_max
+                )
+                metrics['val_pde'] = val_pde.item()
             print(
                 f"Epoch {epoch}: loss={metrics['total_loss']:.4e}, "
                 f"pde={metrics['pde_total']:.4e}, ic={metrics['ic_total']:.4e}, "
+                f"anti={metrics.get('anti_trivial', 0.0):.4e}, "
+                f"eigen={metrics.get('eigenmode', 0.0):.4e}, "
+                f"rhoA={metrics.get('rho_anchor', 0.0):.4e}, "
                 f"vreg={metrics.get('vreg', 0.0):.4e}, grad={metrics['grad_norm']:.4e}"
             )
+            if 'val_pde' in metrics:
+                print(f"         val_pde={metrics['val_pde']:.4e}")
             checkpoint_manager.log_metrics(metrics, epoch, epoch)
 
         is_best = metrics['total_loss'] < best_loss

@@ -313,6 +313,21 @@ class Evaluator:
         denom = np.mean(phi**2) + 1e-12
         diagnostics['mode_amp'] = float(-np.mean(data['vz'] * phi) / denom)
 
+        # Density mode amplitude (even in y and z)
+        phi_rho = np.cos(np.pi * Y_grid / self.physics.Y_half) * \
+                  np.cos(np.pi * Z_grid / (2.0 * self.physics.Z_top))
+        denom_rho = np.mean(phi_rho**2) + 1e-12
+        rho_ic = self.physics.initial_density(
+            torch.tensor(Y_grid, dtype=torch.float64),
+            torch.tensor(Z_grid, dtype=torch.float64),
+        ).numpy()
+        rho_pert = data['rho'] - rho_ic
+        diagnostics['mode_amp_rho'] = float(np.mean(rho_pert * phi_rho) / denom_rho)
+        if abs(diagnostics['mode_amp']) > 1e-12:
+            diagnostics['mode_ratio'] = diagnostics['mode_amp_rho'] / diagnostics['mode_amp']
+        else:
+            diagnostics['mode_ratio'] = 0.0
+
         return diagnostics
 
 

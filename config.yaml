@@ -22,6 +22,7 @@ network:
   output_transform: true
   use_Ax_potential: true
 training:
+  v_threshold: 2.5
   ic_fit:
     enabled: true
     epochs: 500
@@ -50,27 +51,27 @@ training:
     grad_clip: 5.0
     curriculum:
       enabled: true
-      t_warm: 5.0
-      t_grow_epochs: 10000
+      t_warm: 10.0
+      t_grow_epochs: 3000
     causal_weighting:
-      enabled: true
+      enabled: false
       epsilon: 1.0
       min_weight: 0.05
-      mode: early
+      mode: late
     scale_weighting:
-      enabled: true
+      enabled: false
       alpha: 1.0
       t_max: 10.0
       power: 1.0
     residual_normalization:
-      enabled: true
+      enabled: false
       rho_floor: 0.001
     time_stratified:
       enabled: true
       fractions:
-      - 0.5
+      - 0.4
       - 0.3
-      - 0.2
+      - 0.3
       time_fractions:
       - 0.2
       - 0.6
@@ -80,13 +81,46 @@ training:
       tau: 5.77
       t_max: 10.0
       weight: 0.3
-      mode: mode_envelope
-      min_fraction: 0.5
+      mode: mode_tracking
+      min_fraction: 1.0
+    eigenmode_anchor:
+      enabled: true
+      weight: 2.0
+      tau: 5.77
+      times:
+      - 2.0
+      - 5.0
+      - 8.0
+      - 10.0
+      - 12.0
+      - 15.0
+      - 18.0
+      window: 2.0
+      min_points: 16
+    density_anchor:
+      enabled: true
+      weight: 3.0
+      tau: 5.77
+      fraction: 0.3
+      times:
+      - 5.0
+      - 8.0
+      - 10.0
+      - 12.0
+      - 15.0
+      - 18.0
+      window: 2.0
+      min_points: 16
     adaptive_sampling:
       enabled: true
       start_epoch: 1000
       interval: 500
       residual_fraction: 0.5
+    validation:
+      enabled: true
+      n_collocation: 2048
+      every: 200
+      t_max: 10.0
 loss_weights:
   pde:
     continuity: 10.0
@@ -99,7 +133,7 @@ loss_weights:
     z_bottom: 0.3
     z_top: 0.3
   divB: 10.0
-  vreg: 0.001
+  vreg: 0.02
   adaptive:
     enabled: true
     method: softadapt
@@ -134,5 +168,5 @@ eval_grid:
 precision: float64
 seed: 42
 device: cpu
-resume: true
-fresh: false
+resume: false
+fresh: true
