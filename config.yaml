@@ -22,7 +22,7 @@ network:
   output_transform: true
   use_Ax_potential: true
 training:
-  v_threshold: 2.5
+  v_threshold: 2.2
   ic_fit:
     enabled: true
     epochs: 500
@@ -34,7 +34,7 @@ training:
     epochs: 200
     loss_threshold: 0.001
   full:
-    epochs: 50000
+    epochs: 10000
     batch_size_collocation: 1024
     batch_size_ic: 2048
     batch_size_bc: 2048
@@ -85,7 +85,7 @@ training:
       min_fraction: 1.0
     eigenmode_anchor:
       enabled: true
-      weight: 2.0
+      weight: 3.0
       tau: 5.77
       times:
       - 2.0
@@ -97,9 +97,19 @@ training:
       - 18.0
       window: 2.0
       min_points: 16
+      n_bins: 10
+      cap: 2.5
+      fade_t: 15.0
+      fade_width: 3.0
+      t_max: 20.0
+      shape_weight: 0.0
+      shape_t_max: 18.0
+      shape_fade_t: 12.0
+      shape_fade_width: 2.0
+      shape_min_amp: 0.05
     density_anchor:
       enabled: true
-      weight: 3.0
+      weight: 2.0
       tau: 5.77
       fraction: 0.3
       times:
@@ -111,6 +121,9 @@ training:
       - 18.0
       window: 2.0
       min_points: 16
+      cap: 0.6
+      fade_t: 15.0
+      fade_width: 3.0
     adaptive_sampling:
       enabled: true
       start_epoch: 1000
@@ -133,7 +146,7 @@ loss_weights:
     z_bottom: 0.3
     z_top: 0.3
   divB: 10.0
-  vreg: 0.02
+  vreg: 0.05
   adaptive:
     enabled: true
     method: softadapt

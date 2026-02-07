@@ -117,6 +117,17 @@ class PINNLoss:
         self.eigen_times = eigen_cfg.get('times', [2.0, 5.0, 8.0, 10.0])
         self.eigen_window = float(eigen_cfg.get('window', 0.5))
         self.eigen_min_points = int(eigen_cfg.get('min_points', 64))
+        self.eigen_shape_weight = float(eigen_cfg.get('shape_weight', 0.0))
+        self.eigen_shape_t_max = float(eigen_cfg.get('shape_t_max', 18.0))
+        self.eigen_shape_min_amp = float(eigen_cfg.get('shape_min_amp', 0.05))
+        self.eigen_shape_fade_t = float(eigen_cfg.get('shape_fade_t', 12.0))
+        self.eigen_shape_fade_width = float(eigen_cfg.get('shape_fade_width', 2.0))
+        self.eigen_t_max = float(eigen_cfg.get('t_max', self.eigen_shape_t_max))
+        self.eigen_n_bins = int(eigen_cfg.get('n_bins', 0))
+        self.t_min = float(config.get('domain', {}).get('t_min', 0.0))
+        self.eigen_cap = float(eigen_cfg.get('cap', 0.0))
+        self.eigen_fade_t = float(eigen_cfg.get('fade_t', self.eigen_t_max))
+        self.eigen_fade_width = float(eigen_cfg.get('fade_width', 0.0))
 
         # Density mode anchor (valley-enhancing even mode)
         rho_cfg = config.get('training', {}).get('full', {}).get('density_anchor', {})
@@ -127,6 +138,13 @@ class PINNLoss:
         self.rho_anchor_window = float(rho_cfg.get('window', 0.5))
         self.rho_anchor_min_points = int(rho_cfg.get('min_points', 64))
         self.rho_anchor_fraction = float(rho_cfg.get('fraction', 0.1))
+        self.rho_anchor_t_max = float(rho_cfg.get('t_max', 18.0))
+        self.rho_anchor_cap = float(rho_cfg.get('cap', 0.0))
+        self.rho_anchor_fade_t = float(rho_cfg.get('fade_t', self.rho_anchor_t_max))
+        self.rho_anchor_fade_width = float(rho_cfg.get('fade_width', 0.0))
+        self.rho_anchor_cap = float(rho_cfg.get('cap', 0.0))
+        self.rho_anchor_fade_t = float(rho_cfg.get('fade_t', self.rho_anchor_t_max if hasattr(self, 'rho_anchor_t_max') else 18.0))
+        self.rho_anchor_fade_width = float(rho_cfg.get('fade_width', 0.0))
 
         # Scale-aware weighting (emphasize high |z| early)
         scale_cfg = config.get('training', {}).get('full', {}).get('scale_weighting', {})
@@ -313,26 +331,187 @@ class PINNLoss:
         total = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         n_used = 0
 
-        for t0 in self.eigen_times:
-            t0_val = float(t0)
-            mask = torch.abs(t - t0_val) <= self.eigen_window
-            if torch.count_nonzero(mask) < self.eigen_min_points:
-                continue
+        if self.eigen_n_bins > 0:
+            t_max_val = min(self.eigen_t_max, float(t.max().detach()))
+            if t_max_val - self.t_min < 1e-6:
+                return torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
+            mask = t <= t_max_val
+            if not torch.any(mask):
+                return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+            t_m = t[mask]
             y_m = y[mask]
             z_m = z[mask]
             vz_m = vz[mask]
 
-            phi = torch.sin(np.pi * y_m / self.physics.Y_half) * \
-                  torch.cos(np.pi * z_m / (2.0 * self.physics.Z_top))
-            denom = torch.mean(phi**2) + 1e-12
-            A_hat = -torch.mean(vz_m * phi) / denom
-            A_target = self.epsilon * torch.exp(
-                torch.tensor(t0_val, device=self.device, dtype=self.dtype) / self.eigen_tau
+            bin_edges = torch.linspace(
+                self.t_min, t_max_val, self.eigen_n_bins + 1,
+                device=self.device, dtype=self.dtype
             )
+            for i in range(self.eigen_n_bins):
+                bin_mask = (t_m >= bin_edges[i]) & (t_m < bin_edges[i + 1])
+                if torch.count_nonzero(bin_mask) < self.eigen_min_points:
+                    continue
 
-            total = total + (A_hat - A_target)**2
-            n_used += 1
+                t_bin = t_m[bin_mask]
+                y_bin = y_m[bin_mask]
+                z_bin = z_m[bin_mask]
+                vz_bin = vz_m[bin_mask]
+
+                phi = torch.sin(np.pi * y_bin / self.physics.Y_half) * \
+                      torch.cos(np.pi * z_bin / (2.0 * self.physics.Z_top))
+                denom = torch.mean(phi**2) + 1e-12
+                A_hat = -torch.mean(vz_bin * phi) / denom
+                t_bin_mean = t_bin.mean()
+                A_target = self.epsilon * torch.exp(t_bin_mean / self.eigen_tau)
+                if self.eigen_cap > 0:
+                    A_target = torch.minimum(
+                        A_target,
+                        torch.tensor(self.eigen_cap, device=self.device, dtype=self.dtype),
+                    )
+                taper = self._taper(t_bin_mean, self.eigen_fade_t, self.eigen_fade_width)
+                A_target = A_target * taper
+
+                loss_bin = (A_hat - A_target)**2
+                total = total + taper * loss_bin
+                n_used += 1
+        else:
+            for t0 in self.eigen_times:
+                t0_val = float(t0)
+                mask = torch.abs(t - t0_val) <= self.eigen_window
+                if torch.count_nonzero(mask) < self.eigen_min_points:
+                    continue
+
+                y_m = y[mask]
+                z_m = z[mask]
+                vz_m = vz[mask]
+
+                phi = torch.sin(np.pi * y_m / self.physics.Y_half) * \
+                      torch.cos(np.pi * z_m / (2.0 * self.physics.Z_top))
+                denom = torch.mean(phi**2) + 1e-12
+                A_hat = -torch.mean(vz_m * phi) / denom
+                A_target = self.epsilon * torch.exp(
+                    torch.tensor(t0_val, device=self.device, dtype=self.dtype) / self.eigen_tau
+                )
+                if self.eigen_cap > 0:
+                    A_target = torch.minimum(
+                        A_target,
+                        torch.tensor(self.eigen_cap, device=self.device, dtype=self.dtype),
+                    )
+                taper = self._taper(
+                    torch.tensor(t0_val, device=self.device, dtype=self.dtype),
+                    self.eigen_fade_t,
+                    self.eigen_fade_width,
+                )
+                A_target = A_target * taper
+
+                loss_bin = (A_hat - A_target)**2
+                total = total + taper * loss_bin
+                n_used += 1
+
+        if n_used == 0:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        return total / n_used
+
+    def _eigenmode_shape_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Enforce eigenmode shape consistency (suppresses spiky high-k content).
+        """
+        if (not self.eigen_enabled) or (self.eigen_shape_weight <= 0.0):
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        vz = outputs['vz']
+        total = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        n_used = 0
+
+        t_max_val = min(self.eigen_shape_t_max, float(t.max().detach()))
+        if t_max_val - self.t_min < 1e-6:
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        mask_all = t <= t_max_val
+        if not torch.any(mask_all):
+            return torch.tensor(0.0, device=self.device, dtype=self.dtype)
+
+        t_m = t[mask_all]
+        y_m = y[mask_all]
+        z_m = z[mask_all]
+        vz_m = vz[mask_all]
+
+        if self.eigen_n_bins > 0:
+            bin_edges = torch.linspace(
+                self.t_min, t_max_val, self.eigen_n_bins + 1,
+                device=self.device, dtype=self.dtype
+            )
+            for i in range(self.eigen_n_bins):
+                bin_mask = (t_m >= bin_edges[i]) & (t_m < bin_edges[i + 1])
+                if torch.count_nonzero(bin_mask) < self.eigen_min_points:
+                    continue
+
+                y_bin = y_m[bin_mask]
+                z_bin = z_m[bin_mask]
+                vz_bin = vz_m[bin_mask]
+
+                phi = torch.sin(np.pi * y_bin / self.physics.Y_half) * \
+                      torch.cos(np.pi * z_bin / (2.0 * self.physics.Z_top))
+                denom = torch.mean(phi**2) + 1e-12
+                A_hat = -torch.mean(vz_bin * phi) / denom
+
+                if torch.abs(A_hat) < self.eigen_shape_min_amp:
+                    continue
+
+                vz_fit = A_hat * phi
+                numerator = torch.mean((vz_bin - vz_fit)**2)
+                denominator = torch.mean(vz_fit**2) + 1e-8
+                shape_error = numerator / denominator
+                t_bin_mean = t_m[bin_mask].mean()
+                taper = self._taper(t_bin_mean, self.eigen_shape_fade_t, self.eigen_shape_fade_width)
+                if taper < 1e-6:
+                    continue
+                total = total + taper * shape_error
+                n_used += 1
+        else:
+            for t0 in self.eigen_times:
+                t0_val = float(t0)
+                if t0_val > self.eigen_shape_t_max:
+                    continue
+
+                mask = torch.abs(t_m - t0_val) <= self.eigen_window
+                if torch.count_nonzero(mask) < self.eigen_min_points:
+                    continue
+
+                y_bin = y_m[mask]
+                z_bin = z_m[mask]
+                vz_bin = vz_m[mask]
+
+                phi = torch.sin(np.pi * y_bin / self.physics.Y_half) * \
+                      torch.cos(np.pi * z_bin / (2.0 * self.physics.Z_top))
+                denom = torch.mean(phi**2) + 1e-12
+                A_hat = -torch.mean(vz_bin * phi) / denom
+
+                if torch.abs(A_hat) < self.eigen_shape_min_amp:
+                    continue
+
+                vz_fit = A_hat * phi
+                numerator = torch.mean((vz_bin - vz_fit)**2)
+                denominator = torch.mean(vz_fit**2) + 1e-8
+                shape_error = numerator / denominator
+                taper = self._taper(
+                    torch.tensor(t0_val, device=self.device, dtype=self.dtype),
+                    self.eigen_shape_fade_t,
+                    self.eigen_shape_fade_width,
+                )
+                if taper < 1e-6:
+                    continue
+                total = total + taper * shape_error
+                n_used += 1
 
         if n_used == 0:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
@@ -378,6 +557,17 @@ class PINNLoss:
             A_target = self.rho_anchor_fraction * self.epsilon * torch.exp(
                 torch.tensor(t0_val, device=self.device, dtype=self.dtype) / self.rho_anchor_tau
             )
+            if self.rho_anchor_cap > 0:
+                A_target = torch.minimum(
+                    A_target,
+                    torch.tensor(self.rho_anchor_cap, device=self.device, dtype=self.dtype),
+                )
+            taper = self._taper(
+                torch.tensor(t0_val, device=self.device, dtype=self.dtype),
+                self.rho_anchor_fade_t,
+                self.rho_anchor_fade_width,
+            )
+            A_target = A_target * taper
 
             deficit = torch.relu(A_target - A_hat)
             total = total + deficit**2
@@ -387,6 +577,11 @@ class PINNLoss:
             return torch.tensor(0.0, device=self.device, dtype=self.dtype)
 
         return total / n_used
+
+    def _taper(self, t_val: torch.Tensor, center: float, width: float) -> torch.Tensor:
+        if width <= 0:
+            return torch.ones_like(t_val)
+        return 0.5 * (1.0 + torch.tanh((center - t_val) / width))
 
     def compute_pde_loss(self, model: ParkerPINN, t: torch.Tensor,
                          y: torch.Tensor, z: torch.Tensor,
@@ -600,7 +795,9 @@ class PINNLoss:
 
         # Eigenmode anchor (linear theory projection at fixed times)
         eigen_loss = self._eigenmode_loss(outputs_pde, t_pde, y_pde, z_pde)
-        all_losses['eigenmode'] = eigen_loss
+        eigen_shape = self._eigenmode_shape_loss(outputs_pde, t_pde, y_pde, z_pde)
+        all_losses['eigenmode_amp'] = eigen_loss
+        all_losses['eigenmode_shape'] = eigen_shape
 
         # Density mode anchor (valley enhancement)
         rho_anchor = self._density_mode_loss(outputs_pde, t_pde, y_pde, z_pde)
@@ -614,6 +811,7 @@ class PINNLoss:
             + self.w_vreg * vreg_loss
             + self.anti_weight * anti_trivial
             + self.eigen_weight * eigen_loss
+            + self.eigen_shape_weight * eigen_shape
             + self.rho_anchor_weight * rho_anchor
         )
         all_losses['total_loss'] = total
@@ -872,7 +1070,8 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
                 f"Epoch {epoch}: loss={metrics['total_loss']:.4e}, "
                 f"pde={metrics['pde_total']:.4e}, ic={metrics['ic_total']:.4e}, "
                 f"anti={metrics.get('anti_trivial', 0.0):.4e}, "
-                f"eigen={metrics.get('eigenmode', 0.0):.4e}, "
+                f"eigA={metrics.get('eigenmode_amp', 0.0):.4e}, "
+                f"eigS={metrics.get('eigenmode_shape', 0.0):.4e}, "
                 f"rhoA={metrics.get('rho_anchor', 0.0):.4e}, "
                 f"vreg={metrics.get('vreg', 0.0):.4e}, grad={metrics['grad_norm']:.4e}"
             )
