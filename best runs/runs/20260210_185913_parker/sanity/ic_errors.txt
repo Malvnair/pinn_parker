@@ -1,0 +1,1 @@
+{"rho_ic_error": 0.0, "vy_ic_error": 0.0, "vz_ic_error": 0.0, "Ax_ic_error": 0.0, "By_ic_error": 1.4817886367929006e-16, "Bz_ic_error": 0.0}

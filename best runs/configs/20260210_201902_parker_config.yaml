@@ -1,0 +1,211 @@
+checkpoint:
+  atomic_save: true
+  interval: 500
+  keep_last: 5
+device: cpu
+domain:
+  t_max: 12.0
+  t_min: 0.0
+  y_max: 12.0
+  y_min: -12.0
+  z_max: 25.0
+  z_min: -25.0
+eval_grid:
+  ny: 129
+  nz: 129
+  times:
+  - 0
+  - 10
+  - 12
+fresh: true
+logging:
+  interval: 100
+  tensorboard: false
+loss_weights:
+  adaptive:
+    enabled: true
+    method: softadapt
+    softadapt_beta: 0.9
+  bc:
+    y_periodic: 1.0
+    z_bottom: 0.3
+    z_top: 0.3
+  divB: 10.0
+  ic: 10.0
+  pde:
+    continuity: 10.0
+    induction: 10.0
+    momentum_y: 10.0
+    momentum_z: 10.0
+  vreg: 0.008
+network:
+  activation: siren
+  fourier_scale: 1.0
+  hidden_layers: 8
+  hidden_units: 128
+  output_transform: true
+  siren_omega: 1.0
+  siren_omega_0: 30.0
+  use_Ax_potential: true
+  use_fourier_features: false
+  v_bound_enabled: true
+  v_bound_mode: magnitude
+  v_bound_scale: 1.1
+physics:
+  alpha: 1.0
+  cs: 1.0
+  epsilon: 0.2
+  g0: 1.0
+  rho0: 1.0
+precision: float64
+resume: false
+sampling:
+  method: latin_hypercube
+  n_bc: 2048
+  n_collocation: 32768
+  n_ic: 4096
+sanity:
+  ic_drift_threshold: 0.1
+  interval: 1000
+  nan_recovery:
+    enabled: true
+    lr_factor: 0.5
+    max_retries: 3
+seed: 42
+training:
+  full:
+    adaptive_sampling:
+      enabled: false
+      interval: 500
+      residual_fraction: 0.5
+      start_epoch: 1000
+    anti_trivial_anchor:
+      enabled: true
+      min_fraction: 0.8
+      mode: max_v
+      t_max: 12.0
+      tau: 5.77
+      weight: 0.03
+    batch_size_bc: 2048
+    batch_size_collocation: 1024
+    batch_size_ic: 2048
+    causal_weighting:
+      enabled: false
+      epsilon: 1.0
+      min_weight: 0.05
+      mode: late
+    curriculum:
+      enabled: false
+      t_grow_epochs: 3000
+      t_warm: 10.0
+    density_anchor:
+      cap: 1.8
+      enabled: true
+      fade_t: 12.0
+      fade_width: 1.0
+      fraction: 0.2
+      min_points: 16
+      t_max: 12.0
+      tau: 5.77
+      times:
+      - 5.0
+      - 8.0
+      - 10.0
+      - 12.0
+      - 15.0
+      - 18.0
+      weight: 0.3
+      window: 2.0
+    eigenmode_anchor:
+      cap: 1.3
+      enabled: false
+      fade_t: 12.0
+      fade_width: 1.0
+      min_points: 16
+      n_bins: 8
+      shape_fade_t: 12.0
+      shape_fade_width: 2.0
+      shape_min_amp: 0.05
+      shape_t_max: 18.0
+      shape_weight: 0.0
+      t_max: 12.0
+      tau: 5.77
+      times:
+      - 2.0
+      - 5.0
+      - 8.0
+      - 10.0
+      - 12.0
+      - 15.0
+      - 18.0
+      weight: 0.0
+      window: 2.0
+    epochs: 18000
+    grad_clip: 5.0
+    lbfgs_polish:
+      enabled: true
+      lr: 0.5
+      max_iter: 50
+      start_epoch: 40000
+    lr_initial: 0.001
+    lr_min: 1.0e-05
+    lr_schedule: cosine
+    optimizer: adam
+    residual_normalization:
+      enabled: false
+      rho_floor: 0.001
+    scale_weighting:
+      alpha: 1.0
+      enabled: false
+      power: 1.0
+      t_max: 10.0
+    time_stratified:
+      enabled: true
+      fractions:
+      - 0.4
+      - 0.3
+      - 0.3
+      time_fractions:
+      - 0.2
+      - 0.6
+      - 1.0
+    validation:
+      enabled: true
+      every: 200
+      n_collocation: 2048
+      t_max: 10.0
+    weight_decay: 0.0
+  ic_fit:
+    enabled: true
+    epochs: 500
+    lr: 0.001
+    tolerance: 0.0001
+  interface_loss:
+    enabled: false
+    include_divB: false
+    schedule:
+      decay_epochs: 5000
+      final_weights:
+        flux: 1.0
+        gradient: 0.0
+        residual: 0.5
+        state: 1.0
+      type: linear_decay
+      warmup_epochs: 2000
+    weights:
+      flux: 5.0
+      gradient: 0.0
+      residual: 3.0
+      state: 10.0
+  overfit_test:
+    enabled: false
+    epochs: 200
+    loss_threshold: 0.001
+    n_points: 256
+  restart:
+    enabled: false
+    grid_ny: 64
+    grid_nz: 64
+    t0: 0.0
+    teacher_ckpt: ''
+  v_threshold: 1.5
