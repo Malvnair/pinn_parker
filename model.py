@@ -116,6 +116,9 @@ class ParkerPINN(nn.Module):
         self.use_fourier = net_config['use_fourier_features']
         self.use_Ax = net_config['use_Ax_potential']
         self.output_transform = net_config['output_transform']
+        self.v_bound_enabled = net_config.get('v_bound_enabled', False)
+        self.v_bound_mode = net_config.get('v_bound_mode', 'component')
+        self.v_bound_scale = float(net_config.get('v_bound_scale', 2.0))
         
         # Domain bounds for normalization
         self.t_min = config['domain']['t_min']
@@ -208,8 +211,6 @@ class ParkerPINN(nn.Module):
     
     def _init_output_layer(self):
         """Initialize output layer for physically reasonable initial outputs."""
-        # We want the network to initially output something close to the IC
-        # This is handled by the output transform, so we initialize near zero
         with torch.no_grad():
             self.output_layer.bias.zero_()
             self.output_layer.weight.mul_(0.1)
@@ -250,10 +251,8 @@ class ParkerPINN(nn.Module):
         """
         Forward pass with physics-informed output transform.
         
-        The output transform ensures:
-        1. rho > 0 (using softplus)
-        2. IC is approximately satisfied at t=0
-        3. BC structure is respected
+        The output transform ensures rho > 0, IC is approximately satisfied at t=0
+        and BC structure is respected
         
         Returns dictionary with primitive variables.
         """
@@ -280,35 +279,34 @@ class ParkerPINN(nn.Module):
             vy_ic = self.physics.initial_vy(y, z)
             vz_ic = self.physics.initial_vz(y, z)
             
-            # === Output transform redesigned for instability growth ===
-            #
-            # Key insight: the old transform rho = rho_ic * exp(t*tanh(raw)/10)
-            # suppresses perturbation growth by requiring raw ~ O(10) for O(1)
-            # density changes.  The linear velocity form vz = vz_ic + t*raw
-            # requires the network to learn exp(t/tau)/t which is unnecessarily
-            # hard.
-            #
-            # New approach: use (1-exp(-t/sigma))*NN as the correction, where
-            # sigma is a learnable or fixed ramp time.  This gives:
-            #   - exact IC at t=0  (correction vanishes)
-            #   - smooth ramp-on   (no t-discontinuity in derivatives)
-            #   - raw NN output directly controls the perturbation amplitude
-            #     at t >> sigma, without artificial suppression
-            #
-            # For density we keep multiplicative form for positivity.
             
-            sigma = 1.0  # Ramp time scale (~ fraction of growth time)
-            ramp = 1.0 - torch.exp(-t / sigma)  # 0 at t=0, ~1 for t >> sigma
+            sigma = 1.0  
+            ramp = 1.0 - torch.exp(-t / sigma)  
             
-            # Density: multiplicative form, no tanh saturation
-            # rho = rho_ic * exp(ramp * rho_raw)
-            # At t=0: ramp=0 => rho = rho_ic.  Raw output directly sets log-perturbation.
+
+            # Density: multiplicative with smooth ramp to ensure positivity
             rho = rho_ic * torch.exp(ramp * rho_raw)
             rho = torch.clamp(rho, min=1e-6)
             
-            # Velocities: additive with smooth ramp
-            vy = vy_ic + ramp * vy_raw
-            vz = vz_ic + ramp * vz_raw
+            # Velocities: additive with smooth ramp.
+            if self.v_bound_enabled:
+                if self.v_bound_mode == 'magnitude':
+                    # Bound perturbation speed while preserving direction.
+                    raw_speed = torch.sqrt(vy_raw**2 + vz_raw**2 + 1e-12)
+                    dir_y = vy_raw / (raw_speed + 1e-12)
+                    dir_z = vz_raw / (raw_speed + 1e-12)
+                    bounded_speed = self.v_bound_scale * torch.tanh(raw_speed)
+                    dv_y = bounded_speed * dir_y
+                    dv_z = bounded_speed * dir_z
+                    vy = vy_ic + ramp * dv_y
+                    vz = vz_ic + ramp * dv_z
+                else:
+                    # Per-component cap.
+                    vy = vy_ic + ramp * self.v_bound_scale * torch.tanh(vy_raw)
+                    vz = vz_ic + ramp * self.v_bound_scale * torch.tanh(vz_raw)
+            else:
+                vy = vy_ic + ramp * vy_raw
+                vz = vz_ic + ramp * vz_raw
             
             if self.use_Ax:
                 Ax_ic = self.physics.initial_Ax(y, z)
@@ -334,7 +332,7 @@ class ParkerPINN(nn.Module):
                     'Bz': Bz,
                 }
         else:
-            # No output transform - raw outputs with softplus for density
+            # No output transform raw outputs with softplus for density
             rho = torch.nn.functional.softplus(rho_raw) + 1e-6
             
             if self.use_Ax:

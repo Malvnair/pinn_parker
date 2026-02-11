@@ -185,6 +185,28 @@ class CollocationSampler:
             torch.tensor(y, device=device, dtype=dtype),
             torch.tensor(z, device=device, dtype=dtype),
         )
+
+    def sample_interface_grid(
+        self,
+        t0: float,
+        ny: int,
+        nz: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Deterministic grid sampling at a fixed interface time t0.
+        """
+        y = np.linspace(self.y_min, self.y_max, ny)
+        z = np.linspace(self.z_min, self.z_max, nz)
+        Y, Z = np.meshgrid(y, z, indexing='ij')
+        t = np.full_like(Y, t0, dtype=np.float64)
+
+        return (
+            torch.tensor(t.reshape(-1), device=device, dtype=dtype),
+            torch.tensor(Y.reshape(-1), device=device, dtype=dtype),
+            torch.tensor(Z.reshape(-1), device=device, dtype=dtype),
+        )
     
     def sample_bc_y(
         self,

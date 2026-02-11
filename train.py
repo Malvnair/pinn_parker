@@ -667,11 +667,101 @@ class PINNLoss:
         excess = torch.relu(v_mag - self.v_threshold)
         return torch.mean(excess**2)
 
-    def compute_ic_loss(self, model: ParkerPINN, t: torch.Tensor,
-                        y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """Compute initial condition loss."""
+    def _compute_fluxes(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Compute fluxes used for interface continuity."""
+        rho = outputs['rho']
+        vy = outputs['vy']
+        vz = outputs['vz']
+        By = outputs['By']
+        Bz = outputs['Bz']
+
+        P = self.physics.cs_nd**2 * rho
+        B2 = By**2 + Bz**2
+
+        mass_flux = rho * vz
+        mom_flux_z = rho * vz**2 + P + 0.5 * B2 - Bz**2
+        mag_flux = Bz
+
+        return {
+            'mass_flux': mass_flux,
+            'mom_flux_z': mom_flux_z,
+            'mag_flux': mag_flux,
+        }
+
+    def compute_interface_loss(
+        self,
+        model: ParkerPINN,
+        t_if: torch.Tensor,
+        y_if: torch.Tensor,
+        z_if: torch.Tensor,
+        teacher_cache: Dict[str, Dict[str, torch.Tensor]],
+        weights: Dict[str, float],
+        include_divB: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Interface continuity loss at a fixed time t0.
+        """
+        outputs_s, derivs_s = model.compute_derivatives(t_if, y_if, z_if)
+        fluxes_s = self._compute_fluxes(outputs_s)
+
+        # State continuity
+        state_keys = ['rho', 'vy', 'vz', 'Ax'] if self.use_Ax else ['rho', 'vy', 'vz', 'By', 'Bz']
+        state_loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        for key in state_keys:
+            state_loss = state_loss + torch.mean((outputs_s[key] - teacher_cache['outputs'][key])**2)
+        state_rmse = torch.sqrt(state_loss / max(1, len(state_keys)))
+
+        # Flux continuity
+        flux_loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        for key in ['mass_flux', 'mom_flux_z', 'mag_flux']:
+            flux_loss = flux_loss + torch.mean((fluxes_s[key] - teacher_cache['fluxes'][key])**2)
+        flux_rmse = torch.sqrt(flux_loss / 3.0)
+
+        # Residual continuity
+        residuals_s = self.physics.compute_pde_residuals(
+            t_if, y_if, z_if,
+            outputs_s['rho'], outputs_s['vy'], outputs_s['vz'],
+            outputs_s['By'], outputs_s['Bz'],
+            derivs_s
+        )
+        residuals_t = teacher_cache['residuals']
+        res_keys = ['continuity', 'momentum_y', 'momentum_z', 'induction_y', 'induction_z']
+        if include_divB:
+            res_keys.append('divB')
+
+        residual_loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        for key in res_keys:
+            residual_loss = residual_loss + torch.mean((residuals_s[key] - residuals_t[key])**2)
+        residual_rmse = torch.sqrt(residual_loss / max(1, len(res_keys)))
+
+        total = (
+            weights['state'] * state_loss
+            + weights['flux'] * flux_loss
+            + weights['residual'] * residual_loss
+        )
+
+        losses = {
+            'interface_state': state_loss,
+            'interface_flux': flux_loss,
+            'interface_residual': residual_loss,
+            'interface_total': total,
+            'interface_state_rmse': state_rmse,
+            'interface_flux_rmse': flux_rmse,
+            'interface_residual_rmse': residual_rmse,
+        }
+        return total, losses
+
+    def compute_ic_loss(
+        self,
+        model: ParkerPINN,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+        ic_targets: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """Compute initial condition loss (optionally against provided targets)."""
         outputs = model(t, y, z)
-        ic_true = self.physics.get_initial_conditions(y, z)
+        ic_true = ic_targets if ic_targets is not None else self.physics.get_initial_conditions(y, z)
 
         losses = {}
         total = torch.tensor(0.0, device=self.device, dtype=self.dtype)
@@ -767,7 +857,8 @@ class PINNLoss:
                  t_pde: torch.Tensor, y_pde: torch.Tensor, z_pde: torch.Tensor,
                  t_ic: torch.Tensor, y_ic: torch.Tensor, z_ic: torch.Tensor,
                  sampler: CollocationSampler, n_bc: int,
-                 current_t_horizon: Optional[float] = None) -> Tuple[torch.Tensor, Dict]:
+                 current_t_horizon: Optional[float] = None,
+                 ic_targets: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[torch.Tensor, Dict]:
         """Compute total loss."""
         all_losses = {}
 
@@ -782,7 +873,7 @@ class PINNLoss:
         all_losses['vreg'] = vreg_loss
 
         # IC
-        ic_loss, ic_losses = self.compute_ic_loss(model, t_ic, y_ic, z_ic)
+        ic_loss, ic_losses = self.compute_ic_loss(model, t_ic, y_ic, z_ic, ic_targets=ic_targets)
         all_losses.update(ic_losses)
 
         # BC
@@ -920,6 +1011,43 @@ def run_overfit_test(model, config, physics, bc, sampler, device, dtype):
     return passed
 
 
+def get_interface_weights(epoch: int, iface_cfg: dict) -> Dict[str, float]:
+    """Compute interface loss weights based on schedule."""
+    weights = iface_cfg.get('weights', {})
+    schedule = iface_cfg.get('schedule', {})
+    sched_type = schedule.get('type', 'constant')
+
+    def _base(w):
+        return {
+            'state': float(w.get('state', 1.0)),
+            'flux': float(w.get('flux', 1.0)),
+            'residual': float(w.get('residual', 1.0)),
+            'gradient': float(w.get('gradient', 0.0)),
+        }
+
+    if sched_type == 'constant' or not schedule:
+        return _base(weights)
+
+    warmup = int(schedule.get('warmup_epochs', 0))
+    decay = int(schedule.get('decay_epochs', 0))
+    final = schedule.get('final_weights', {})
+
+    w0 = _base(weights)
+    w1 = _base(final) if final else w0
+
+    if epoch < warmup:
+        return w0
+
+    if decay <= 0:
+        return w1
+
+    if epoch >= warmup + decay:
+        return w1
+
+    alpha = (epoch - warmup) / decay
+    return {k: w0[k] + alpha * (w1[k] - w0[k]) for k in w0}
+
+
 def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adaptive_sampler,
                sanity_checker, evaluator, checkpoint_manager, device, dtype, start_epoch=0):
     """Stage 3: Full PINN training."""
@@ -935,8 +1063,67 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
     val_cfg = train_config.get('validation', {})
     val_enabled = val_cfg.get('enabled', False)
     val_every = int(val_cfg.get('every', config['logging']['interval']))
+    restart_cfg = config['training'].get('restart', {})
+    iface_cfg = config['training'].get('interface_loss', {})
 
     loss_fn = PINNLoss(config, physics, bc, device, dtype)
+    restart_enabled = restart_cfg.get('enabled', False)
+    iface_enabled = iface_cfg.get('enabled', False) and restart_enabled
+
+    teacher_cache = None
+    t_if = y_if = z_if = None
+    ic_targets = None
+
+    if restart_enabled:
+        teacher_ckpt = Path(restart_cfg.get('teacher_ckpt', ''))
+        if not teacher_ckpt.exists():
+            raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_ckpt}")
+
+        teacher_run = teacher_ckpt.parent.parent
+        teacher_cfg = yaml.safe_load(open(teacher_run / "config.yaml"))
+        teacher_physics, _ = create_physics(teacher_cfg)
+        teacher_model = create_model(teacher_cfg, teacher_physics).to(device)
+        ckpt = torch.load(teacher_ckpt, map_location=device, weights_only=False)
+        teacher_model.load_state_dict(ckpt["model_state_dict"])
+        teacher_model.eval()
+
+        t0 = float(restart_cfg.get('t0', 0.0))
+        grid_ny = int(restart_cfg.get('grid_ny', 64))
+        grid_nz = int(restart_cfg.get('grid_nz', 64))
+        t_if, y_if, z_if = sampler.sample_interface_grid(t0, grid_ny, grid_nz, device, dtype)
+
+        t_t = t_if.clone().detach().requires_grad_(True)
+        y_t = y_if.clone().detach().requires_grad_(True)
+        z_t = z_if.clone().detach().requires_grad_(True)
+        t_out, t_derivs = teacher_model.compute_derivatives(t_t, y_t, z_t)
+        teacher_outputs = {k: v.detach().to(dtype) for k, v in t_out.items()}
+        teacher_derivs = {k: v.detach().to(dtype) for k, v in t_derivs.items()}
+        teacher_fluxes = loss_fn._compute_fluxes(teacher_outputs)
+        teacher_residuals = teacher_physics.compute_pde_residuals(
+            t_if, y_if, z_if,
+            teacher_outputs['rho'], teacher_outputs['vy'], teacher_outputs['vz'],
+            teacher_outputs['By'], teacher_outputs['Bz'],
+            teacher_derivs,
+        )
+        teacher_residuals = {k: v.detach().to(dtype) for k, v in teacher_residuals.items()}
+
+        teacher_cache = {
+            'outputs': teacher_outputs,
+            'derivs': teacher_derivs,
+            'fluxes': teacher_fluxes,
+            'residuals': teacher_residuals,
+        }
+
+        ic_targets = {
+            'rho': teacher_outputs['rho'],
+            'vy': teacher_outputs['vy'],
+            'vz': teacher_outputs['vz'],
+        }
+        if config['network']['use_Ax_potential']:
+            ic_targets['Ax'] = teacher_outputs['Ax']
+        else:
+            ic_targets['By'] = teacher_outputs['By']
+            ic_targets['Bz'] = teacher_outputs['Bz']
     val_data = None
     if val_enabled:
         import numpy as _np
@@ -981,13 +1168,26 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
             else:
                 t_pde, y_pde, z_pde = sampler.sample_interior(batch_size_coll, device, dtype)
 
-        t_ic, y_ic, z_ic = sampler.sample_ic(batch_size_ic, device, dtype)
+        if restart_enabled:
+            t_ic, y_ic, z_ic = t_if, y_if, z_if
+        else:
+            t_ic, y_ic, z_ic = sampler.sample_ic(batch_size_ic, device, dtype)
 
         optimizer.zero_grad()
         total_loss, losses = loss_fn(
             model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc,
-            current_t_horizon=current_t_max
+            current_t_horizon=current_t_max,
+            ic_targets=ic_targets
         )
+        if iface_enabled and teacher_cache is not None:
+            weights = get_interface_weights(epoch, iface_cfg)
+            include_divB = bool(iface_cfg.get('include_divB', False))
+            iface_loss, iface_losses = loss_fn.compute_interface_loss(
+                model, t_if, y_if, z_if, teacher_cache, weights, include_divB=include_divB
+            )
+            total_loss = total_loss + iface_loss
+            losses.update(iface_losses)
+            losses['total_loss'] = total_loss
         total_loss.backward()
 
         if grad_clip > 0:
@@ -1073,8 +1273,16 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
                 f"eigA={metrics.get('eigenmode_amp', 0.0):.4e}, "
                 f"eigS={metrics.get('eigenmode_shape', 0.0):.4e}, "
                 f"rhoA={metrics.get('rho_anchor', 0.0):.4e}, "
+                f"iface={metrics.get('interface_total', 0.0):.4e}, "
                 f"vreg={metrics.get('vreg', 0.0):.4e}, grad={metrics['grad_norm']:.4e}"
             )
+            if iface_enabled and 'interface_state_rmse' in metrics:
+                print(
+                    "         iface_rmse: "
+                    f"state={metrics['interface_state_rmse']:.4e}, "
+                    f"flux={metrics['interface_flux_rmse']:.4e}, "
+                    f"res={metrics['interface_residual_rmse']:.4e}"
+                )
             if 'val_pde' in metrics:
                 print(f"         val_pde={metrics['val_pde']:.4e}")
             checkpoint_manager.log_metrics(metrics, epoch, epoch)
@@ -1096,10 +1304,18 @@ def train_full(model, optimizer, scheduler, config, physics, bc, sampler, adapti
 
             def closure():
                 lbfgs_opt.zero_grad()
-                loss, _ = loss_fn(
+                loss, losses_lbfgs = loss_fn(
                     model, t_pde, y_pde, z_pde, t_ic, y_ic, z_ic, sampler, batch_size_bc,
-                    current_t_horizon=current_t_max
+                    current_t_horizon=current_t_max,
+                    ic_targets=ic_targets
                 )
+                if iface_enabled and teacher_cache is not None:
+                    weights = get_interface_weights(epoch, iface_cfg)
+                    include_divB = bool(iface_cfg.get('include_divB', False))
+                    iface_loss, _ = loss_fn.compute_interface_loss(
+                        model, t_if, y_if, z_if, teacher_cache, weights, include_divB=include_divB
+                    )
+                    loss = loss + iface_loss
                 loss.backward()
                 return loss
 
@@ -1219,10 +1435,11 @@ def main():
     print("="*60)
     sanity_checker.run_all_pretrain_checks(model, device, dtype)
 
-    if config['training']['ic_fit']['enabled'] and start_epoch == 0:
+    restart_enabled = config.get('training', {}).get('restart', {}).get('enabled', False)
+    if config['training']['ic_fit']['enabled'] and start_epoch == 0 and not restart_enabled:
         train_ic_only(model, optimizer, physics, sampler, config, device, dtype, checkpoint_manager)
 
-    if config['training']['overfit_test']['enabled'] and start_epoch == 0:
+    if config['training']['overfit_test']['enabled'] and start_epoch == 0 and not restart_enabled:
         run_overfit_test(model, config, physics, bc, sampler, device, dtype)
 
     train_full(

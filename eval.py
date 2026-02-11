@@ -85,6 +85,7 @@ class Evaluator:
         outputs = model(T, Y_grad, Z_grad)
         
         # Get By, Bz if using Ax potential
+        Ax = None
         if 'Ax' in outputs:
             Ax = outputs['Ax']
             
@@ -114,6 +115,8 @@ class Evaluator:
             'By': By.detach().reshape(self.ny, self.nz).cpu().numpy(),
             'Bz': Bz.detach().reshape(self.ny, self.nz).cpu().numpy(),
         }
+        if Ax is not None:
+            result['Ax'] = Ax.detach().reshape(self.ny, self.nz).cpu().numpy()
         
         # Derived quantities
         result['B_mag'] = np.sqrt(result['By']**2 + result['Bz']**2)
